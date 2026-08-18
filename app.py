@@ -13,11 +13,11 @@ import plotly.graph_objects as go
 from groq import Groq
 
 # ============================================================
-# AI CONSENSUS TRADING V6.0 (SMC EDITION - OB & FVG)
+# AI CONSENSUS TRADING V6.0 (SMC EDITION - FULL UI)
 # - Menggunakan Order Block & Fair Value Gap
 # - Bypass Groq JSON Sensors (Qwen Model)
 # - Dynamic TP/SL Execution
-# - Sidebar Info Restored
+# - Full Dashboard Visuals Restored
 # ============================================================
 
 st.set_page_config(page_title="AI Consensus Trading V6 SMC", page_icon="🧠", layout="wide")
@@ -112,47 +112,38 @@ def atr(df, n=14):
     tr = pd.concat([df.High - df.Low, (df.High - df.Close.shift()).abs(), (df.Low - df.Close.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-# === FUNGSI MATEMATIKA SMART MONEY CONCEPTS (SMC) ===
 def detect_smc(df):
     fvgs = {"bullish": [], "bearish": []}
     obs = {"bullish": [], "bearish": []}
     
-    # Deteksi FVG
     for i in range(2, len(df) - 1):
         atr_val = df['ATR'].iloc[i]
-        # Bullish FVG
         if df['Low'].iloc[i] > df['High'].iloc[i-2]:
             gap = df['Low'].iloc[i] - df['High'].iloc[i-2]
-            if gap > atr_val * 0.1: # Filter celah terlalu kecil
+            if gap > atr_val * 0.1: 
                 fvgs["bullish"].append({"bottom": df['High'].iloc[i-2], "top": df['Low'].iloc[i]})
-        # Bearish FVG
         elif df['High'].iloc[i] < df['Low'].iloc[i-2]:
             gap = df['Low'].iloc[i-2] - df['High'].iloc[i]
             if gap > atr_val * 0.1:
                 fvgs["bearish"].append({"bottom": df['High'].iloc[i], "top": df['Low'].iloc[i-2]})
                 
-    # Deteksi Order Block (OB)
     for i in range(1, len(df) - 1):
         body = abs(df['Close'].iloc[i] - df['Open'].iloc[i])
         atr_val = df['ATR'].iloc[i]
         
-        # Bullish OB (Displacement naik besar)
         if df['Close'].iloc[i] > df['Open'].iloc[i] and body > atr_val * 1.5:
-            # Cari candle merah terakhir sebelum lonjakan
             for j in range(i-1, max(-1, i-6), -1):
                 if df['Close'].iloc[j] < df['Open'].iloc[j]:
                     obs["bullish"].append({"bottom": df['Low'].iloc[j], "top": df['High'].iloc[j]})
                     break
-        # Bearish OB (Displacement turun besar)
         elif df['Close'].iloc[i] < df['Open'].iloc[i] and body > atr_val * 1.5:
-            # Cari candle hijau terakhir sebelum anjlok
             for j in range(i-1, max(-1, i-6), -1):
                 if df['Close'].iloc[j] > df['Open'].iloc[j]:
                     obs["bearish"].append({"bottom": df['Low'].iloc[j], "top": df['High'].iloc[j]})
                     break
 
     return {
-        "fvg_bull": fvgs["bullish"][-2:], # Ambil 2 terdekat
+        "fvg_bull": fvgs["bullish"][-2:], 
         "fvg_bear": fvgs["bearish"][-2:],
         "ob_bull": obs["bullish"][-2:],
         "ob_bear": obs["bearish"][-2:]
@@ -253,7 +244,7 @@ def scan_markets(n=60):
     return sorted(out, key=lambda x: x["score"], reverse=True)
 
 # -------------------------
-# AI engine — KUNCI QWEN BYPASS ERROR + PAWANG JSON
+# AI engine — KUNCI QWEN + PERBAIKAN JSON
 # -------------------------
 ANALYST_MODEL = "qwen/qwen3.6-27b"
 DEBATE_MODEL = "qwen/qwen3.6-27b"
@@ -352,8 +343,8 @@ def _request_groq(model, prompt, key, max_tokens):
             }
         ],
         "temperature": 0.1,
-        "max_tokens": int(max_tokens),
-        "response_format": {"type": "json_object"}
+        "max_tokens": int(max_tokens)
+        # Menghapus strict json_object agar server Groq tidak error 400 dengan Qwen
     }
     return client.chat.completions.create(**kwargs)
 
@@ -392,7 +383,7 @@ def market_packet(symbol):
     frames = {"15m": klines(symbol, "15m", 180)}
     ob = order_book(symbol)
     d = frames["15m"]
-    smc_data = detect_smc(d) # Injeksi perhitungan SMC
+    smc_data = detect_smc(d) 
     c = candle_info(d)
     
     packet = {
@@ -428,9 +419,6 @@ ANALYSTS = [
     ("🕯️ Price Action Analyst", "Fokus reaksi candle (rejection/engulfing) saat harga menyentuh Order Block.")
 ]
 
-def analyst_summary_text(items):
-    return "\n".join([f"{x['agent']} | {x['decision']} | Bukti={'; '.join(x.get('evidence', []))} | TP: {x['tp_price']} | SL: {x['sl_price']}" for x in items])
-
 def run_multi_agent(symbol, scanner_score_value):
     frames, packet = market_packet(symbol)
     data = specialist_data(packet, "all")
@@ -439,7 +427,7 @@ def run_multi_agent(symbol, scanner_score_value):
     for name, rule in ANALYSTS:
         analyst_results.append({"agent": name, **call_ai(name, data, rule, tier="analyst")})
 
-    analyst_summary = analyst_summary_text(analyst_results)
+    analyst_summary = "\n".join([f"{x['agent']} | {x['decision']} | TP: {x['tp_price']} | SL: {x['sl_price']}" for x in analyst_results])
 
     debate_data = data + "\n\nANALYSTS:\n" + analyst_summary
     bull = call_ai("🐂 SMC Bull", debate_data, "Bangun kasus LONG berdasarkan Bullish OB/FVG.", tier="debate")
@@ -458,7 +446,6 @@ def run_multi_agent(symbol, scanner_score_value):
     current = packet["price"]
     atr15 = packet["timeframes"]["15m"]["atr"]
     
-    # === DYNAMIC TP / SL LOGIC ===
     if final in {"LONG", "SHORT"}:
         ai_tp = portfolio.get("tp_price", 0.0)
         ai_sl = portfolio.get("sl_price", 0.0)
@@ -478,8 +465,7 @@ def run_multi_agent(symbol, scanner_score_value):
 
     return {
         "symbol": symbol, "frames": frames, "packet": packet, "analysts": analyst_results,
-        "bull": bull, "bear": bear, "research_manager": {"decision": "Bypassed", "reasoning": "", "confidence": 0}, 
-        "trader": trader, "risk_agents": [], "portfolio": portfolio, "final": final,
+        "bull": bull, "bear": bear, "trader": trader, "portfolio": portfolio, "final": final,
         "scanner_score": scanner_score_value, "entry": current if final != "WAIT" else None, "sl": sl, "tp": tp, "rr": rr
     }
 
@@ -490,9 +476,8 @@ def save_signal(result):
     con = db()
     now = datetime.now(timezone.utc).isoformat()
     cur = con.execute("INSERT INTO signals (created_at,symbol,timeframe,scanner_score,final_decision,confidence,entry,stop_loss,take_profit,risk_reward,market_regime,score_consensus,reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (now, result["symbol"], "15m SMC", result["scanner_score"], result["final"], result["portfolio"]["confidence"], result["entry"], result["sl"], result["tp"], result["rr"], result["packet"]["market_regime"], result["scanner_score"], result["portfolio"]["reasoning"]))
-    signal_id = cur.lastrowid
     con.commit(); con.close()
-    return signal_id
+    return cur.lastrowid
 
 def current_price(symbol):
     return float(bget("/api/v3/ticker/price", {"symbol": symbol})["price"])
@@ -514,23 +499,6 @@ def update_paper_trades():
             updated.append((row["symbol"], res, r_mult))
     con.commit(); con.close()
     return updated
-
-def performance():
-    con = db()
-    closed = con.execute("SELECT * FROM signals WHERE result IN ('TP','SL') ORDER BY id DESC").fetchall()
-    open_count = con.execute("SELECT COUNT(*) FROM signals WHERE result IS NULL AND final_decision IN ('LONG','SHORT')").fetchone()[0]
-    con.close()
-    if not closed: return {"closed": 0, "open": open_count, "win_rate": 0, "avg_r": 0, "profit_factor": 0}
-    wins = sum(1 for x in closed if x["result"] == "TP")
-    losses = sum(1 for x in closed if x["result"] == "SL")
-    positive = sum(max(float(x["r_multiple"]), 0) for x in closed)
-    negative = abs(sum(min(float(x["r_multiple"]), 0) for x in closed))
-    return {"closed": len(closed), "open": open_count, "win_rate": wins / len(closed) * 100, "avg_r": sum(float(x["r_multiple"]) for x in closed) / len(closed), "profit_factor": (positive / negative if negative else float("inf"))}
-
-def telegram(message):
-    if not TG_TOKEN or not TG_CHAT: return False, "Telegram belum dikonfigurasi."
-    r = requests.post(f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TG_TOKEN}/sendMessage", json={"chat_id": TG_CHAT, "text": message}, timeout=12)
-    return r.status_code == 200, "OK" if r.status_code == 200 else r.text[:300]
 
 # -------------------------
 # UI
@@ -558,9 +526,7 @@ if st.sidebar.button("🔄 UPDATE PAPER TRADES", use_container_width=True):
 st.sidebar.divider()
 st.sidebar.header("🤖 AI Status")
 st.sidebar.write("Groq:", "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA")
-if GROQ_KEYS:
-    st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)}")
-
+if GROQ_KEYS: st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)}")
 st.sidebar.caption("Arsitektur V6 SMC:")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL}")
 st.sidebar.caption(f"🐂/🐻 Debate: {DEBATE_MODEL}")
@@ -568,12 +534,6 @@ st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL}")
 st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s")
 # -----------------------------
 
-perf = performance()
-st.subheader("📊 V6 SMC Performance Lab")
-p1, p2, p3, p4, p5 = st.columns(5)
-p1.metric("Signal Closed", perf["closed"]); p2.metric("Open Paper Trade", perf["open"]); p3.metric("Win Rate", f"{perf['win_rate']:.1f}%")
-p4.metric("Average R", f"{perf['avg_r']:+.2f}R"); pf = "∞" if math.isinf(perf["profit_factor"]) else f"{perf['profit_factor']:.2f}"
-p5.metric("Profit Factor", pf)
 st.divider()
 
 if not st.session_state.scan:
@@ -596,14 +556,42 @@ else:
         c1.metric("Harga", f"${result['packet']['price']:,.6f}")
         c2.metric("Regime", result['packet']['market_regime'])
         
-        # Tampilkan data SMC yang terdeteksi ke layar
         smc = result['packet']['smc']
         smc_text = ""
         if smc['ob_bull']: smc_text += f"🟢 Bull OB: {smc['ob_bull'][-1]['bottom']:.4f} - {smc['ob_bull'][-1]['top']:.4f}\n"
         if smc['ob_bear']: smc_text += f"🔴 Bear OB: {smc['ob_bear'][-1]['top']:.4f} - {smc['ob_bear'][-1]['bottom']:.4f}"
-        c3.info(smc_text if smc_text else "Menunggu zona terbentuk...")
+        c3.info(smc_text if smc_text else "Menunggu zona OB terbentuk...")
 
-        # Keputusan Final
+        # 1. TAMPILKAN GRAFIK CANDLESTICK
+        ch = result["frames"]["15m"].tail(100)
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=ch.index, open=ch.Open, high=ch.High, low=ch.Low, close=ch.Close, name="Candlestick"))
+        fig.update_layout(height=400, template="plotly_dark", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 2. TAMPILKAN ANALYST TEAM
+        st.markdown("### 🧩 SMC Analyst Team")
+        cols = st.columns(len(result["analysts"]))
+        for col, agent in zip(cols, result["analysts"]):
+            with col:
+                if agent["decision"] == "LONG":
+                    col.success(f"**{agent['agent']}**\n\nLONG (Conf: {agent['confidence']:.0f})\n\n{agent['reasoning']}")
+                elif agent["decision"] == "SHORT":
+                    col.error(f"**{agent['agent']}**\n\nSHORT (Conf: {agent['confidence']:.0f})\n\n{agent['reasoning']}")
+                else:
+                    col.warning(f"**{agent['agent']}**\n\nWAIT (Conf: {agent['confidence']:.0f})\n\n{agent['reasoning']}")
+
+        # 3. TAMPILKAN BULL VS BEAR
+        st.markdown("### 🐂 Bull vs 🐻 Bear Debate")
+        b1, b2 = st.columns(2)
+        b1.success(f"**🐂 SMC Bull:** {result['bull']['decision']} (Conf: {result['bull']['confidence']:.0f})\n\n{result['bull']['reasoning']}")
+        b2.error(f"**🐻 SMC Bear:** {result['bear']['decision']} (Conf: {result['bear']['confidence']:.0f})\n\n{result['bear']['reasoning']}")
+
+        # 4. TAMPILKAN TRADER PLAN
+        st.markdown("### 💹 Smart Trader Plan")
+        st.info(f"**Decision:** {result['trader']['decision']}\n\n**Reasoning:** {result['trader']['reasoning']}\n\n**Risk:** {result['trader']['key_risk']}")
+
+        # 5. KEPUTUSAN FINAL & TP/SL KARTU
         st.markdown("### 👨‍⚖️ SMC Final Judge Decision")
         final = result["final"]
         if final == "LONG": st.success(f"🚀 **LONG {symbol}** — Confidence: {result['portfolio']['confidence']:.0f}")
@@ -612,7 +600,6 @@ else:
         
         st.write(result["portfolio"]["reasoning"])
         
-        # Eksekusi Dynamic TP/SL
         if final in {"LONG", "SHORT"}:
             e1, e2, e3, e4 = st.columns(4)
             e1.metric("Dynamic Entry", f"${result['entry']:,.8f}")
@@ -620,5 +607,7 @@ else:
             e3.metric("Dynamic TP", f"${result['tp']:,.8f}")
             e4.metric("Risk / Reward", f"1:{result['rr']:.1f}")
 
-            if st.button(f"💾 Simpan Signal {symbol}"): save_signal(result); st.success("Tersimpan ke V6 SMC Journal.")
+            if st.button(f"💾 Simpan Signal {symbol}"): 
+                save_signal(result)
+                st.success("Tersimpan ke V6 SMC Journal.")
         st.divider()
