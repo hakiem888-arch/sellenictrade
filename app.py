@@ -17,6 +17,7 @@ from groq import Groq
 # - Menggunakan Order Block & Fair Value Gap
 # - Bypass Groq JSON Sensors (Qwen Model)
 # - Dynamic TP/SL Execution
+# - Sidebar Info Restored
 # ============================================================
 
 st.set_page_config(page_title="AI Consensus Trading V6 SMC", page_icon="🧠", layout="wide")
@@ -252,7 +253,7 @@ def scan_markets(n=60):
     return sorted(out, key=lambda x: x["score"], reverse=True)
 
 # -------------------------
-# AI engine — KUNCI QWEN BYPASS ERROR
+# AI engine — KUNCI QWEN BYPASS ERROR + PAWANG JSON
 # -------------------------
 ANALYST_MODEL = "qwen/qwen3.6-27b"
 DEBATE_MODEL = "qwen/qwen3.6-27b"
@@ -340,9 +341,19 @@ def _request_groq(model, prompt, key, max_tokens):
     client = Groq(api_key=key)
     kwargs = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an API. You must output strictly valid JSON ONLY. No explanations, no markdown, no chat."
+            },
+            {
+                "role": "user", 
+                "content": prompt
+            }
+        ],
         "temperature": 0.1,
-        "max_tokens": int(max_tokens)
+        "max_tokens": int(max_tokens),
+        "response_format": {"type": "json_object"}
     }
     return client.chat.completions.create(**kwargs)
 
@@ -526,6 +537,8 @@ def telegram(message):
 # -------------------------
 if "scan" not in st.session_state: st.session_state.scan = []
 st.title("🧠 AI Consensus V6 SMC (Smart Money Edition)")
+
+# ---- SIDEBAR PANEL KIRI ----
 st.sidebar.header("🔎 Scanner SMC")
 scan_n = st.sidebar.slider("Koin discan", 20, 100, 60)
 top_n = st.sidebar.slider("Dianalisis AI", 1, 3, 1)
@@ -541,6 +554,19 @@ if st.sidebar.button("🔄 UPDATE PAPER TRADES", use_container_width=True):
     if updates:
         for symbol, res, r in updates: st.sidebar.success(f"{symbol}: {res} ({r:+.1f}R)")
     else: st.sidebar.info("Belum ada trade TP/SL.")
+
+st.sidebar.divider()
+st.sidebar.header("🤖 AI Status")
+st.sidebar.write("Groq:", "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA")
+if GROQ_KEYS:
+    st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)}")
+
+st.sidebar.caption("Arsitektur V6 SMC:")
+st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL}")
+st.sidebar.caption(f"🐂/🐻 Debate: {DEBATE_MODEL}")
+st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL}")
+st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s")
+# -----------------------------
 
 perf = performance()
 st.subheader("📊 V6 SMC Performance Lab")
