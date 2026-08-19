@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import ast
 import math
 import sqlite3
 import time
@@ -17,7 +18,7 @@ from groq import Groq
 # - Menggunakan Order Block & Fair Value Gap
 # - Bypass Groq JSON Sensors (Qwen Model)
 # - Dynamic TP/SL Execution
-# - Full Dashboard Visuals Restored
+# - Robust AST JSON Parser + Raw Error Tracker
 # ============================================================
 
 st.set_page_config(page_title="AI Consensus Trading V6 SMC", page_icon="🧠", layout="wide")
@@ -244,7 +245,7 @@ def scan_markets(n=60):
     return sorted(out, key=lambda x: x["score"], reverse=True)
 
 # -------------------------
-# AI engine — KUNCI QWEN + PERBAIKAN JSON
+# AI engine — KUNCI QWEN + ROBUST JSON AST PARSER
 # -------------------------
 ANALYST_MODEL = "qwen/qwen3.6-27b"
 DEBATE_MODEL = "qwen/qwen3.6-27b"
@@ -252,10 +253,10 @@ RESEARCH_MODEL = "qwen/qwen3.6-27b"
 JUDGE_MODEL = "qwen/qwen3.6-27b"
 
 MODEL_TIERS = {
-    "analyst": {"model": ANALYST_MODEL, "max_tokens": 300},
-    "debate": {"model": DEBATE_MODEL, "max_tokens": 400},
-    "research": {"model": RESEARCH_MODEL, "max_tokens": 700},
-    "judge": {"model": JUDGE_MODEL, "max_tokens": 700},
+    "analyst": {"model": ANALYST_MODEL, "max_tokens": 800},
+    "debate": {"model": DEBATE_MODEL, "max_tokens": 800},
+    "research": {"model": RESEARCH_MODEL, "max_tokens": 1000},
+    "judge": {"model": JUDGE_MODEL, "max_tokens": 1000},
 }
 
 GROQ_MIN_DELAY = 1.0
@@ -281,19 +282,38 @@ def compact_json(obj, max_chars=1400):
 
 def _safe_json_from_text(raw):
     raw = (raw or "").strip()
-    if raw.startswith("```json"): raw = raw[7:]
-    elif raw.startswith("```"): raw = raw[3:]
-    if raw.endswith("```"): raw = raw[:-3]
-    raw = raw.strip()
+    if not raw:
+        raise ValueError("Respons AI kosong melompong.")
+        
+    # Pembersihan Markdown ekstrim
+    cleaned = re.sub(r"```[a-zA-Z]*\n?", "", raw)
+    cleaned = cleaned.replace("```", "").strip()
     
-    try: return json.loads(raw)
-    except Exception: pass
+    try: 
+        return json.loads(cleaned)
+    except Exception: 
+        pass
     
-    if "{" in raw and "}" in raw:
-        candidate = raw[raw.find("{"):raw.rfind("}") + 1]
-        try: return json.loads(candidate)
-        except Exception: pass
-    raise ValueError("Respons AI bukan JSON valid.")
+    # Deteksi kurung kurawal terdalam/terluar
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start:end+1]
+        try: 
+            return json.loads(candidate)
+        except Exception:
+            pass
+        
+        # Jurus Pamungkas: AST Literal Eval (mengakali single quotes dari Qwen)
+        try:
+            parsed = ast.literal_eval(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+            
+    # Jika gagal total, tampilkan KALIMAT MENTAH Qwen ke layar Anda!
+    raise ValueError(f"RAW OUTPUT QWEN: {raw[:300]}...")
 
 def _normalize_ai(obj, tier):
     if not isinstance(obj, dict): raise ValueError("Output AI bukan object JSON.")
@@ -318,10 +338,10 @@ def _build_prompt(role, data, instructions):
     return f"""Kamu adalah {role} dalam sistem riset trading SMC (Smart Money Concepts).
 TUGAS: {instructions}
 ATURAN WAJIB:
-1. Gunakan data Order Block (OB) dan Fair Value Gap (FVG). Jangan pakai MA/Lagging indicator jika ada OB/FVG.
+1. Gunakan data Order Block (OB) dan Fair Value Gap (FVG). Jangan pakai MA/Lagging indicator.
 2. Jika harga belum mencapai OB/FVG, pilih WAIT. Jika harga memitigasi OB, pilih LONG/SHORT.
-3. WAJIB JAWAB DALAM FORMAT JSON SAJA.
-4. Tentukan tp_price dan sl_price berdasarkan batas OB/FVG terdekat.
+3. JAWABAN HARUS BERUPA JSON MURNI TANPA TEKS LAIN SEPERTI "Baik" atau "Ini hasilnya".
+4. Tentukan tp_price dan sl_price berdasarkan batas OB/FVG terdekat (JIKA WAIT, ISI 0.0).
 CONTOH JSON:
 {{"decision":"LONG","confidence":85,"reasoning":"Harga memitigasi bullish OB.","key_risk":"Tembus support OB.","evidence":["Mitigasi Bull OB di 65000"],"tp_price":66000.0,"sl_price":64500.0}}
 DATA:
@@ -335,7 +355,7 @@ def _request_groq(model, prompt, key, max_tokens):
         "messages": [
             {
                 "role": "system",
-                "content": "You are an API. You must output strictly valid JSON ONLY. No explanations, no markdown, no chat."
+                "content": "You are a rigid data API. You output ONLY valid JSON format. NO conversational text. NO markdown formatting. Just the JSON."
             },
             {
                 "role": "user", 
@@ -344,7 +364,6 @@ def _request_groq(model, prompt, key, max_tokens):
         ],
         "temperature": 0.1,
         "max_tokens": int(max_tokens)
-        # Menghapus strict json_object agar server Groq tidak error 400 dengan Qwen
     }
     return client.chat.completions.create(**kwargs)
 
@@ -374,7 +393,7 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
         obj = _safe_json_from_text(content)
         return _normalize_ai(obj, tier)
     except Exception as e:
-        return {"decision": "WAIT", "confidence": 0, "reasoning": f"AI error: {e}", "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
+        return {"decision": "WAIT", "confidence": 0, "reasoning": str(e), "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
 
 # -------------------------
 # Market packet & Data Injector
