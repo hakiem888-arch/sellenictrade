@@ -14,18 +14,18 @@ import plotly.graph_objects as go
 from groq import Groq
 
 # ============================================================
-# AI CONSENSUS TRADING V6.2 (ULTIMATE SCALPER & FUTURES EDITION)
-# - Binance Perpetual Futures API (fapi)
+# AI CONSENSUS TRADING V6.2.1 (SPOT SCALPER EDITION)
+# - Binance Spot API (Bebas Blokir Error 451)
 # - Timeframe 5 Menit (SMC 5m)
 # - Bollinger Squeeze Scanner (Cari konsolidasi sebelum ledakan)
 # - Full Bahasa Indonesia Strict Prompt
 # ============================================================
 
-st.set_page_config(page_title="AI Consensus V6.2 Futures Scalper", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AI Consensus V6.2 Spot Scalper", page_icon="🧠", layout="wide")
 
-# MIGRATION TO BINANCE FUTURES
-BINANCE = "https://fapi.binance.com"
-DB_FILE = "trading_v6_futures.db"
+# MIGRATION BACK TO BINANCE SPOT (Menghindari Error 451 Geoblocking)
+BINANCE = "https://data-api.binance.vision"
+DB_FILE = "trading_v6_spot.db"
 
 # -------------------------
 # Secrets & API Key Parsing
@@ -87,17 +87,17 @@ def init_db():
 init_db()
 
 # -------------------------
-# Binance Futures & SMC Indicators
+# Binance Spot & SMC Indicators
 # -------------------------
 def bget(path, params=None):
-    r = requests.get(BINANCE + path, params=params, timeout=15, headers={"User-Agent": "AI-V6.2-FUTURES"})
-    if r.status_code != 200: raise RuntimeError(f"Binance Futures HTTP {r.status_code}: {r.text[:500]}")
+    r = requests.get(BINANCE + path, params=params, timeout=15, headers={"User-Agent": "AI-V6.2-SPOT"})
+    if r.status_code != 200: raise RuntimeError(f"Binance HTTP {r.status_code}: {r.text[:500]}")
     return r.json()
 
 def binance_health():
     try:
-        bget("/fapi/v1/ping")
-        return True, "FUTURES ONLINE"
+        bget("/api/v3/ping")
+        return True, "SPOT ONLINE"
     except Exception as e:
         return False, str(e)
 
@@ -175,8 +175,8 @@ def detect_patterns(df):
         
     return ", ".join(patterns) if patterns else "Konsolidasi / Sideways"
 
-def klines(symbol, interval="5m", limit=180): # DIUBAH KE 5 MENIT (SCALPER MODE)
-    x = bget("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+def klines(symbol, interval="5m", limit=180):
+    x = bget("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     cols = ["time", "Open", "High", "Low", "Close", "Volume", "close_time", "QuoteVolume", "Trades", "TakerBuyBase", "TakerBuyQuote", "ignore"]
     d = pd.DataFrame(x, columns=cols)
     for c in ["Open", "High", "Low", "Close", "Volume", "QuoteVolume", "Trades", "TakerBuyBase", "TakerBuyQuote"]:
@@ -185,14 +185,13 @@ def klines(symbol, interval="5m", limit=180): # DIUBAH KE 5 MENIT (SCALPER MODE)
     d["EMA20"] = ema(d.Close, 20); d["EMA50"] = ema(d.Close, 50)
     d["RSI"] = rsi(d.Close); d["ATR"] = atr(d)
     d["BB_MID"], d["BB_UP"], d["BB_LOW"] = bollinger(d.Close)
-    # Kalkulasi BB Width untuk deteksi Squeeze (Konsolidasi)
     d["BB_WIDTH"] = (d.BB_UP - d.BB_LOW) / d.BB_MID
     d["VOL_RATIO"] = d.Volume / d.Volume.rolling(20).mean()
     d["BUY_PRESSURE"] = d.TakerBuyQuote / d.QuoteVolume.replace(0, pd.NA)
     return d.dropna()
 
 def order_book(symbol, limit=20):
-    x = bget("/fapi/v1/depth", {"symbol": symbol, "limit": limit})
+    x = bget("/api/v3/depth", {"symbol": symbol, "limit": limit})
     bid = sum(float(q) for _, q in x.get("bids", []))
     ask = sum(float(q) for _, q in x.get("asks", []))
     total = bid + ask
@@ -226,19 +225,17 @@ def market_regime(d):
     return "TRENDING"
 
 # -------------------------
-# Squeeze Scanner (Fokus Konsolidasi & Order Block)
+# Squeeze Scanner
 # -------------------------
 def scanner_score(symbol, change, qvol, d, ob):
     a = d.iloc[-1]
     score = 50; why = []
     
-    # Fokus 1: Cari Bollinger Squeeze (Penyempitan sebelum ledakan)
     bbw = float(a.BB_WIDTH)
     if bbw < 0.01: score += 20; why.append("Squeeze Ekstrim")
     elif bbw < 0.02: score += 10; why.append("Konsolidasi Squeeze")
     elif bbw > 0.06: score -= 15; why.append("Terlalu Lebar/Volatil")
     
-    # Fokus 2: Menghindari koin yang sudah terlanjur terbang/anjlok di pucuk
     if abs(change) > 10: score -= 20; why.append("Sudah Over-extended")
     
     vr = float(a.VOL_RATIO)
@@ -247,7 +244,7 @@ def scanner_score(symbol, change, qvol, d, ob):
     
     buy = float(a.BUY_PRESSURE)
     if buy >= 0.60: score += 10; why.append("Taker-Buy Dominan")
-    elif buy <= 0.40: score += 10; why.append("Taker-Sell Dominan") # Futures bisa SHORT, jadi ini bagus
+    elif buy <= 0.40: score += 10; why.append("Taker-Sell Dominan")
     
     r = float(a.RSI)
     if 40 <= r <= 60: score += 5; why.append("RSI Netral (Siap Breakout)")
@@ -255,23 +252,22 @@ def scanner_score(symbol, change, qvol, d, ob):
     return max(0, min(100, round(score))), why
 
 def scan_markets(n=60):
-    tickers = bget("/fapi/v1/ticker/24hr")
+    tickers = bget("/api/v3/ticker/24hr")
     candidates = []
     stable_like = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE"}
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("USDT") or symbol[:-4] in stable_like: continue
         qvol = float(t.get("quoteVolume", 0) or 0)
-        if qvol < 10_000_000: continue # Futures butuh likuiditas lebih besar
+        if qvol < 5_000_000: continue
         candidates.append((symbol, float(t.get("priceChangePercent", 0) or 0), qvol))
     
-    # Sortir berdasarkan volume (cari yang likuid)
     candidates.sort(key=lambda x: x[2], reverse=True)
     out = []; progress = st.progress(0); status = st.empty()
     for i, (symbol, change, qvol) in enumerate(candidates[:n]):
-        status.write(f"🔎 Memindai Futures {symbol} ({i+1}/{min(len(candidates), n)})")
+        status.write(f"🔎 Memindai Spot {symbol} ({i+1}/{min(len(candidates), n)})")
         try:
-            d = klines(symbol, "5m", 100); ob = order_book(symbol) # Pindah ke 5m TF
+            d = klines(symbol, "5m", 100); ob = order_book(symbol)
             score, why = scanner_score(symbol, change, qvol, d, ob)
             a = d.iloc[-1]
             out.append({"symbol": symbol, "change": change, "qvol": qvol, "vr": float(a.VOL_RATIO), "buy": float(a.BUY_PRESSURE), "imb": float(ob["imbalance"]), "spread": float(ob["spread"]), "rsi": float(a.RSI), "bbw": float(a.BB_WIDTH), "score": score, "why": why})
@@ -349,14 +345,15 @@ def _normalize_ai(obj, tier):
     }
 
 def _build_prompt(role, data, instructions):
-    return f"""Kamu adalah {role} dalam sistem riset trading SMC & Momentum (Pasar Futures).
+    return f"""Kamu adalah {role} dalam sistem riset trading SMC & Momentum (Pasar Spot).
 TUGAS: {instructions}
 ATURAN WAJIB:
 1. Analisis Order Block (OB), Fair Value Gap (FVG), dan Pola Momentum.
-2. JANGAN RAGU EKSEKUSI: Jika harga memitigasi OB, atau ada Bollinger Squeeze dengan pola konfirmasi, pilih LONG atau SHORT. Di pasar Futures, SHORT adalah valid jika menabrak Resistance/Bear OB.
-3. JAWABAN HARUS BERUPA JSON MURNI TANPA TEKS LAIN.
-4. PENTING: SELURUH TEKS (reasoning, key_risk, evidence) WAJIB DITULIS DALAM BAHASA INDONESIA. JANGAN GUNAKAN BAHASA INGGRIS.
-5. Tentukan tp_price dan sl_price secara dinamis dari zona SMC (JIKA WAIT, ISI 0.0).
+2. JANGAN RAGU EKSEKUSI LONG: Jika harga memitigasi OB, atau ada Bollinger Squeeze dengan pola Bullish, pilih LONG. 
+3. Karena ini pasar Spot, SHORT hanya dipakai sebagai peringatan atau paper-trade pelacakan arah Bearish.
+4. JAWABAN HARUS BERUPA JSON MURNI TANPA TEKS LAIN.
+5. PENTING: SELURUH TEKS WAJIB DITULIS DALAM BAHASA INDONESIA. JANGAN GUNAKAN BAHASA INGGRIS.
+6. Tentukan tp_price dan sl_price secara dinamis dari zona SMC (JIKA WAIT, ISI 0.0).
 CONTOH JSON:
 {{"decision":"LONG","confidence":85,"reasoning":"Harga memitigasi bullish OB di timeframe 5 menit dengan kuat.","key_risk":"False breakout ke bawah zona FVG.","evidence":["Mitigasi Bullish OB","Strong Bull Momentum"],"tp_price":66000.0,"sl_price":64500.0}}
 DATA:
@@ -440,7 +437,7 @@ def market_packet(symbol):
 def specialist_data(packet, focus):
     smc = packet["smc"]
     lines = [
-        f"Symbol: {packet['symbol']} (FUTURES) | Harga: {packet['price']:.8f} | Regime: {packet['market_regime']}",
+        f"Symbol: {packet['symbol']} (SPOT) | Harga: {packet['price']:.8f} | Regime: {packet['market_regime']}",
         "[SMART MONEY CONCEPTS (SMC) & MOMENTUM - TIMEFRAME 5 MENIT]"
     ]
     lines.append(f"Candlestick Terakhir: {packet['candlestick']['name']}")
@@ -477,17 +474,17 @@ def run_multi_agent(symbol, scanner_score_value):
 
     debate_data = data + "\n\nANALYSTS:\n" + analyst_summary
     bull = call_ai("🐂 SMC Bull", debate_data, "Bangun kasus LONG. Gunakan Bullish OB/FVG ATAU momentum Breakout Bullish di TF 5m.", tier="debate")
-    bear = call_ai("🐻 SMC Bear", debate_data, "Bangun kasus SHORT. Gunakan Bearish OB/FVG. Jangan takut SHORT di pasar Futures ini jika Momentum Bearish kuat.", tier="debate")
+    bear = call_ai("🐻 SMC Bear", debate_data, "Bangun kasus SHORT. Gunakan Bearish OB/FVG untuk paper-trade atau peringatan bahaya.", tier="debate")
     debate = f"BULL: {bull['decision']}\nBEAR: {bear['decision']}"
 
     trader_input = f"Market: {symbol} price={packet['price']:.8f}\nData SMC:\n{data}\nDebate: {debate}"
-    trader = call_ai("💹 Smart Trader", trader_input, "Buat rencana trading scalping agresif (LONG/SHORT). Manfaatkan volatilitas dan mitigasi. Tentukan tp_price dan sl_price dinamis yang realistis.", tier="analyst")
+    trader = call_ai("💹 Smart Trader", trader_input, "Buat rencana trading scalping agresif. Manfaatkan volatilitas dan mitigasi. Tentukan tp_price dan sl_price dinamis yang realistis.", tier="analyst")
 
     judge_input = f"MARKET: {symbol} price={packet['price']:.8f}\nTRADER:\n{compact_json(trader)}\nDATA SMC:\n{data}"
     portfolio = call_ai("👨‍⚖️ Final SMC Judge", judge_input, "Ambil keputusan final LONG/SHORT/WAIT untuk Scalping. Keluarkan tp_price (di zona likuiditas/OB lawan) dan sl_price (di belakang OB kita).", tier="judge")
 
     final = portfolio["decision"]
-    if portfolio.get("confidence", 0) < 50: final = "WAIT" # Sedikit lebih longgar untuk Scalping
+    if portfolio.get("confidence", 0) < 50: final = "WAIT"
 
     current = packet["price"]
     atr5 = packet["timeframes"]["5m"]["atr"]
@@ -526,7 +523,7 @@ def save_signal(result):
     return cur.lastrowid
 
 def current_price(symbol):
-    return float(bget("/fapi/v1/ticker/price", {"symbol": symbol})["price"])
+    return float(bget("/api/v3/ticker/price", {"symbol": symbol})["price"])
 
 def update_paper_trades():
     con = db(); rows = con.execute("SELECT * FROM signals WHERE result IS NULL AND final_decision IN ('LONG','SHORT')").fetchall(); updated = []
@@ -550,10 +547,10 @@ def update_paper_trades():
 # UI
 # -------------------------
 if "scan" not in st.session_state: st.session_state.scan = []
-st.title("🧠 AI Consensus V6.2 (SMC Scalper & Futures Edition)")
+st.title("🧠 AI Consensus V6.2.1 (SMC Spot Scalper Edition)")
 
 # ---- SIDEBAR PANEL KIRI ----
-st.sidebar.header("🔎 Scanner Squeeze Futures")
+st.sidebar.header("🔎 Scanner Squeeze Spot")
 scan_n = st.sidebar.slider("Koin discan", 20, 100, 60)
 top_n = st.sidebar.slider("Dianalisis AI", 1, 3, 1)
 
@@ -561,7 +558,7 @@ if st.sidebar.button("🔍 SCAN MARKET", use_container_width=True):
     ok, status = binance_health()
     if not ok: st.error(f"❌ Offline: {status}")
     else:
-        with st.spinner("🛰️ Mencari market Futures & mendeteksi Squeeze/OB..."): st.session_state.scan = scan_markets(scan_n)
+        with st.spinner("🛰️ Mencari market Spot & mendeteksi Squeeze/OB..."): st.session_state.scan = scan_markets(scan_n)
 
 if st.sidebar.button("🔄 UPDATE PAPER TRADES", use_container_width=True):
     updates = update_paper_trades()
@@ -575,7 +572,7 @@ st.sidebar.write("Groq:", "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA")
 if GROQ_KEYS: 
     aktif = st.session_state.get('_active_groq_key', 0) + 1
     st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)} (Memakai Key #{aktif})")
-st.sidebar.caption("Arsitektur V6.2 Scalper:")
+st.sidebar.caption("Arsitektur V6.2.1 Scalper:")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL}")
 st.sidebar.caption(f"🐂/🐻 Debate: {DEBATE_MODEL}")
 st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL}")
@@ -585,10 +582,10 @@ st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s")
 st.divider()
 
 if not st.session_state.scan:
-    st.info("Klik SCAN MARKET untuk memindai pasar Perpetual Futures.")
+    st.info("Klik SCAN MARKET untuk memindai pasar Spot 5 Menit.")
 else:
-    st.subheader("🔥 Top Kandidat Scalping (Futures)")
-    rows = [{"Rank": i, "Symbol": x["symbol"], "Score": x["score"], "24h": f"{x['change']:+.2f}%", "Squeeze (BBW)": f"{x['bbw']:.4f}"} for i, x in enumerate(st.session_state.scan[:10], 1)]
+    st.subheader("🔥 Top Kandidat Scalping (Spot)")
+    rows = [{"Rank": i, "Symbol": x["symbol"], "Score": x["score"], "24h": f"{x['change']:+.2f}%", "Squeeze (BBW)": f"{x.get('bbw', 0.0):.4f}"} for i, x in enumerate(st.session_state.scan[:10], 1)]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.divider()
 
@@ -655,5 +652,5 @@ else:
 
             if st.button(f"💾 Simpan Signal {symbol}"): 
                 save_signal(result)
-                st.success("Tersimpan ke V6.2 Journal.")
+                st.success("Tersimpan ke V6.2.1 Journal.")
         st.divider()
