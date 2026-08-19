@@ -14,16 +14,14 @@ import plotly.graph_objects as go
 from groq import Groq
 
 # ============================================================
-# AI CONSENSUS TRADING V6.0 (SMC EDITION - FULL UI & AUTO ROTATE)
-# - Menggunakan Order Block & Fair Value Gap
-# - Bypass Groq JSON Sensors (Qwen Model)
+# AI CONSENSUS TRADING V6.1 (SMC + MOMENTUM EDITION)
+# - Order Block & Fair Value Gap
+# - Breakout & Candlestick Pattern Recognition
 # - Dynamic TP/SL Execution
-# - Robust AST JSON Parser + Raw Error Tracker
-# - Auto-Rotate 7+ API Keys
-# - Full Bahasa Indonesia Prompt
+# - Auto-Rotate API Keys & Robust JSON Parser
 # ============================================================
 
-st.set_page_config(page_title="AI Consensus Trading V6 SMC", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AI Consensus V6.1 SMC Momentum", page_icon="🧠", layout="wide")
 
 BINANCE = "https://data-api.binance.vision"
 DB_FILE = "trading_v6.db"
@@ -49,8 +47,8 @@ _GROQ_KEYS.extend(_parse_secret_list(secret("GROQ_API_KEYS")))
 for _i in range(1, 21):
     _GROQ_KEYS.extend(_parse_secret_list(secret(f"GROQ_API_KEY_{_i}")))
 
-# Menghapus duplikat API Key
 GROQ_KEYS = list(dict.fromkeys(k for k in _GROQ_KEYS if k))
+GROQ_KEY = GROQ_KEYS[0] if GROQ_KEYS else ""
 
 TG_TOKEN = secret("TELEGRAM_BOT_TOKEN")
 TG_CHAT = secret("TELEGRAM_CHAT_ID")
@@ -88,7 +86,7 @@ def init_db():
 init_db()
 
 # -------------------------
-# Binance & SMC Indicators
+# Binance & SMC/Momentum Indicators
 # -------------------------
 def bget(path, params=None):
     r = requests.get(BINANCE + path, params=params, timeout=15, headers={"User-Agent": "AI-V6-SMC"})
@@ -151,6 +149,25 @@ def detect_smc(df):
         "ob_bull": obs["bullish"][-2:],
         "ob_bear": obs["bearish"][-2:]
     }
+
+def detect_patterns(df):
+    patterns = []
+    if len(df) < 21: return "Data tidak cukup"
+    
+    recent_high = df['High'].iloc[-21:-1].max()
+    recent_low = df['Low'].iloc[-21:-1].min()
+    current_close = df['Close'].iloc[-1]
+    
+    if current_close > recent_high: patterns.append("🔥 BULLISH BREAKOUT (New 20-candle High)")
+    elif current_close < recent_low: patterns.append("🩸 BEARISH BREAKDOWN (New 20-candle Low)")
+    
+    c1, c2, c3 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    if c1.Close > c1.Open and c2.Close > c2.Open and c3.Close > c3.Open:
+        if c1.Close > c2.Close > c3.Close: patterns.append("🚀 STRONG BULL MOMENTUM (3 Green Candles)")
+    elif c1.Close < c1.Open and c2.Close < c2.Open and c3.Close < c3.Open:
+        if c1.Close < c2.Close < c3.Close: patterns.append("💥 STRONG BEAR MOMENTUM (3 Red Candles)")
+        
+    return ", ".join(patterns) if patterns else "Tidak ada momentum agresif/Breakout"
 
 def klines(symbol, interval="15m", limit=180):
     x = bget("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
@@ -315,16 +332,16 @@ def _normalize_ai(obj, tier):
     }
 
 def _build_prompt(role, data, instructions):
-    return f"""Kamu adalah {role} dalam sistem riset trading SMC (Smart Money Concepts).
+    return f"""Kamu adalah {role} dalam sistem riset trading SMC & Momentum.
 TUGAS: {instructions}
 ATURAN WAJIB:
-1. Gunakan data Order Block (OB) dan Fair Value Gap (FVG). Jangan pakai MA/Lagging indicator.
-2. Jika harga belum mencapai OB/FVG, pilih WAIT. Jika harga memitigasi OB, pilih LONG/SHORT.
+1. Analisis Order Block (OB), Fair Value Gap (FVG), DAN POLA MOMENTUM CANDLESTICK.
+2. JANGAN WAIT JIKA ADA MOMENTUM: Boleh mengeksekusi LONG/SHORT jika harga memitigasi OB/FVG, ATAU jika ada indikasi Breakout kuat / Reversal Candlestick meskipun harga belum menyentuh OB. Tangkap momentumnya!
 3. JAWABAN HARUS BERUPA JSON MURNI TANPA TEKS LAIN.
 4. SELURUH TEKS (reasoning, key_risk, evidence) WAJIB DITULIS DALAM BAHASA INDONESIA.
-5. Tentukan tp_price dan sl_price berdasarkan batas OB/FVG terdekat (JIKA WAIT, ISI 0.0).
+5. Tentukan tp_price dan sl_price secara logis dari chart (JIKA WAIT, ISI 0.0).
 CONTOH JSON:
-{{"decision":"LONG","confidence":85,"reasoning":"Harga memitigasi bullish OB dan memantul kuat.","key_risk":"Tembus level support OB di bawah.","evidence":["Mitigasi Bull OB di 65000"],"tp_price":66000.0,"sl_price":64500.0}}
+{{"decision":"LONG","confidence":85,"reasoning":"Terjadi bullish breakout kuat dengan pola engulfing.","key_risk":"False breakout ke bawah zona FVG.","evidence":["Bullish Engulfing","Strong Bull Momentum"],"tp_price":66000.0,"sl_price":64500.0}}
 DATA:
 {data}
 """
@@ -353,14 +370,10 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
     max_tokens = budget or cfg["max_tokens"]
     prompt = _build_prompt(role, data, instructions)
     
-    # Inisialisasi index key aktif jika belum ada
-    if "_active_groq_key" not in st.session_state:
-        st.session_state["_active_groq_key"] = 0
-        
+    if "_active_groq_key" not in st.session_state: st.session_state["_active_groq_key"] = 0
     total_keys = len(GROQ_KEYS)
     start_index = st.session_state["_active_groq_key"] % total_keys
     
-    # ROTASI OTOMATIS: Coba semua kunci satu per satu jika kena limit
     for offset in range(total_keys):
         current_index = (start_index + offset) % total_keys
         current_key = GROQ_KEYS[current_index]
@@ -371,9 +384,8 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
             if wait > 0: time.sleep(wait)
             
             raw = _request_groq(cfg["model"], prompt, current_key, max_tokens)
-            
             st.session_state["_last_ai_call"] = time.time()
-            st.session_state["_active_groq_key"] = current_index # Simpan kunci yang berhasil
+            st.session_state["_active_groq_key"] = current_index 
             
             content = raw.choices[0].message.content or ""
             obj = _safe_json_from_text(content)
@@ -382,14 +394,11 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
         except Exception as e:
             msg = str(e)
             if "429" in msg or "rate_limit" in msg.lower() or "quota" in msg.lower() or "billing" in msg.lower():
-                # API Limit tersentuh, lanjutkan iterasi loop untuk pindah ke API Key berikutnya
                 continue 
             else:
-                # Error format JSON atau lainnya, langsung keluar (bukan karena kuota)
                 return {"decision": "WAIT", "confidence": 0, "reasoning": f"AI error: {msg}", "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
                 
-    # Jika loop selesai dan tidak ada return, berarti 7 kunci semuanya mati/kena limit
-    return {"decision": "WAIT", "confidence": 0, "reasoning": "Seluruh API Key (7 buah) kehabisan kuota atau terkena limit 429.", "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
+    return {"decision": "WAIT", "confidence": 0, "reasoning": "Seluruh API Key (7 buah) kehabisan kuota atau terkena limit.", "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
 
 # -------------------------
 # Market packet & Data Injector
@@ -399,12 +408,13 @@ def market_packet(symbol):
     ob = order_book(symbol)
     d = frames["15m"]
     smc_data = detect_smc(d) 
+    patterns = detect_patterns(d)
     c = candle_info(d)
     
     packet = {
         "symbol": symbol, "price": float(d.iloc[-1].Close), "market_regime": market_regime(d),
         "order_book": ob, "support": float(d.Low.tail(30).min()), "resistance": float(d.High.tail(30).max()),
-        "candlestick": c, "smc": smc_data, "timeframes": {}
+        "candlestick": c, "patterns": patterns, "smc": smc_data, "timeframes": {}
     }
     x = d.iloc[-1]
     packet["timeframes"]["15m"] = {"price": float(x.Close), "rsi": float(x.RSI), "atr": float(x.ATR), "vol_ratio": float(x.VOL_RATIO), "buy_pressure": float(x.BUY_PRESSURE)}
@@ -414,8 +424,11 @@ def specialist_data(packet, focus):
     smc = packet["smc"]
     lines = [
         f"Symbol: {packet['symbol']} | Harga: {packet['price']:.8f} | Regime: {packet['market_regime']}",
-        "[SMART MONEY CONCEPTS (SMC) - 15m ZONES]"
+        "[SMART MONEY CONCEPTS (SMC) & MOMENTUM]"
     ]
+    lines.append(f"Candlestick Terakhir: {packet['candlestick']['name']}")
+    lines.append(f"Pola & Momentum Terbaru: {packet['patterns']}")
+    
     if smc["fvg_bull"]: lines.append(f"Bullish FVG: {smc['fvg_bull'][-1]['bottom']:.8f} - {smc['fvg_bull'][-1]['top']:.8f}")
     if smc["fvg_bear"]: lines.append(f"Bearish FVG: {smc['fvg_bear'][-1]['top']:.8f} - {smc['fvg_bear'][-1]['bottom']:.8f}")
     if smc["ob_bull"]: lines.append(f"Bullish OB: {smc['ob_bull'][-1]['bottom']:.8f} - {smc['ob_bull'][-1]['top']:.8f}")
@@ -429,9 +442,9 @@ def specialist_data(packet, focus):
 # Orchestration
 # -------------------------
 ANALYSTS = [
-    ("🧭 SMC Analyst", "Fokus area Order Block dan FVG. Harga harus masuk zona (mitigasi) untuk validasi LONG/SHORT."),
+    ("🧭 SMC Analyst", "Fokus area Order Block dan FVG. Jika tidak ada mitigasi, cari indikasi breakout kuat dari Pola & Momentum."),
     ("📚 Liquidity Analyst", "Fokus order-book imbalance, spread, liquidity sweeps di sekitar zona SMC."),
-    ("🕯️ Price Action Analyst", "Fokus reaksi candle (rejection/engulfing) saat harga menyentuh Order Block.")
+    ("🕯️ Price Action Analyst", "Fokus reaksi candle (rejection/engulfing) dan Pola & Momentum untuk mengonfirmasi arah trend saat ini.")
 ]
 
 def run_multi_agent(symbol, scanner_score_value):
@@ -445,15 +458,15 @@ def run_multi_agent(symbol, scanner_score_value):
     analyst_summary = "\n".join([f"{x['agent']} | {x['decision']} | TP: {x['tp_price']} | SL: {x['sl_price']}" for x in analyst_results])
 
     debate_data = data + "\n\nANALYSTS:\n" + analyst_summary
-    bull = call_ai("🐂 SMC Bull", debate_data, "Bangun kasus LONG berdasarkan Bullish OB/FVG.", tier="debate")
-    bear = call_ai("🐻 SMC Bear", debate_data, "Serang thesis Bull, cari Bearish OB/FVG untuk kasus SHORT.", tier="debate")
+    bull = call_ai("🐂 SMC Bull", debate_data, "Bangun kasus LONG. Gunakan Bullish OB/FVG ATAU momentum Breakout Bullish.", tier="debate")
+    bear = call_ai("🐻 SMC Bear", debate_data, "Serang thesis Bull. Cari Bearish OB/FVG atau indikasi kelemahan momentum untuk kasus SHORT.", tier="debate")
     debate = f"BULL: {bull['decision']}\nBEAR: {bear['decision']}"
 
     trader_input = f"Market: {symbol} price={packet['price']:.8f}\nData SMC:\n{data}\nDebate: {debate}"
-    trader = call_ai("💹 Smart Trader", trader_input, "Buat rencana trading dari Order Block. Tentukan tp_price dan sl_price dinamis dari data SMC.", tier="analyst")
+    trader = call_ai("💹 Smart Trader", trader_input, "Buat rencana trading agresif. Jangan takut mengeksekusi jika ada Momentum kuat meskipun jauh dari OB. Tentukan tp_price dan sl_price dinamis.", tier="analyst")
 
     judge_input = f"MARKET: {symbol} price={packet['price']:.8f}\nTRADER:\n{compact_json(trader)}\nDATA SMC:\n{data}"
-    portfolio = call_ai("👨‍⚖️ Final SMC Judge", judge_input, "Ambil keputusan final. WAJIB keluarkan tp_price (di batas resisten/OB lawan) dan sl_price (di bawah batas OB kita) jika LONG/SHORT.", tier="judge")
+    portfolio = call_ai("👨‍⚖️ Final SMC Judge", judge_input, "Ambil keputusan final. Eksekusi LONG/SHORT jika ada Momentum atau mitigasi OB. Keluarkan tp_price dan sl_price yang logis.", tier="judge")
 
     final = portfolio["decision"]
     if portfolio.get("confidence", 0) < 55: final = "WAIT"
@@ -490,7 +503,7 @@ def run_multi_agent(symbol, scanner_score_value):
 def save_signal(result):
     con = db()
     now = datetime.now(timezone.utc).isoformat()
-    cur = con.execute("INSERT INTO signals (created_at,symbol,timeframe,scanner_score,final_decision,confidence,entry,stop_loss,take_profit,risk_reward,market_regime,score_consensus,reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (now, result["symbol"], "15m SMC", result["scanner_score"], result["final"], result["portfolio"]["confidence"], result["entry"], result["sl"], result["tp"], result["rr"], result["packet"]["market_regime"], result["scanner_score"], result["portfolio"]["reasoning"]))
+    cur = con.execute("INSERT INTO signals (created_at,symbol,timeframe,scanner_score,final_decision,confidence,entry,stop_loss,take_profit,risk_reward,market_regime,score_consensus,reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (now, result["symbol"], "15m Momentum SMC", result["scanner_score"], result["final"], result["portfolio"]["confidence"], result["entry"], result["sl"], result["tp"], result["rr"], result["packet"]["market_regime"], result["scanner_score"], result["portfolio"]["reasoning"]))
     con.commit(); con.close()
     return cur.lastrowid
 
@@ -519,7 +532,7 @@ def update_paper_trades():
 # UI
 # -------------------------
 if "scan" not in st.session_state: st.session_state.scan = []
-st.title("🧠 AI Consensus V6 SMC (Smart Money Edition)")
+st.title("🧠 AI Consensus V6.1 (SMC & Momentum Edition)")
 
 # ---- SIDEBAR PANEL KIRI ----
 st.sidebar.header("🔎 Scanner SMC")
@@ -544,7 +557,7 @@ st.sidebar.write("Groq:", "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA")
 if GROQ_KEYS: 
     aktif = st.session_state.get('_active_groq_key', 0) + 1
     st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)} (Memakai Key #{aktif})")
-st.sidebar.caption("Arsitektur V6 SMC:")
+st.sidebar.caption("Arsitektur V6.1:")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL}")
 st.sidebar.caption(f"🐂/🐻 Debate: {DEBATE_MODEL}")
 st.sidebar.caption(f"👨‍⚖️ Judge: {JUDGE_MODEL}")
@@ -554,9 +567,9 @@ st.sidebar.caption(f"⏱️ Jeda AI: {GROQ_MIN_DELAY:.1f}s")
 st.divider()
 
 if not st.session_state.scan:
-    st.info("Klik SCAN MARKET untuk mendeteksi zona likuiditas.")
+    st.info("Klik SCAN MARKET untuk mendeteksi zona likuiditas dan pola momentum.")
 else:
-    st.subheader("🔥 Top Kandidat SMC")
+    st.subheader("🔥 Top Kandidat SMC & Momentum")
     rows = [{"Rank": i, "Symbol": x["symbol"], "Score": x["score"], "24h": f"{x['change']:+.2f}%", "Vol Ratio": f"{x['vr']:.2f}x"} for i, x in enumerate(st.session_state.scan[:10], 1)]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.divider()
@@ -565,7 +578,7 @@ else:
         symbol = candidate["symbol"]
         st.markdown(f"## #{rank} {symbol} — SMC Analysis")
 
-        with st.spinner(f"🧠 Membaca Order Block & FVG untuk {symbol}..."):
+        with st.spinner(f"🧠 Membaca Momentum, Order Block & FVG untuk {symbol}..."):
             try: result = run_multi_agent(symbol, candidate["score"])
             except Exception as e: st.error(f"Gagal: {e}"); continue
 
@@ -573,11 +586,10 @@ else:
         c1.metric("Harga", f"${result['packet']['price']:,.6f}")
         c2.metric("Regime", result['packet']['market_regime'])
         
-        smc = result['packet']['smc']
-        smc_text = ""
-        if smc['ob_bull']: smc_text += f"🟢 Bull OB: {smc['ob_bull'][-1]['bottom']:.4f} - {smc['ob_bull'][-1]['top']:.4f}\n"
-        if smc['ob_bear']: smc_text += f"🔴 Bear OB: {smc['ob_bear'][-1]['top']:.4f} - {smc['ob_bear'][-1]['bottom']:.4f}"
-        c3.info(smc_text if smc_text else "Menunggu zona OB terbentuk...")
+        # UI Tambahan untuk Momentum & Candlestick
+        momentum_text = result['packet']['patterns']
+        candle_text = result['packet']['candlestick']['name']
+        c3.info(f"🕯️ Candle: {candle_text}\n\n⚡ Momentum: {momentum_text}")
 
         # 1. TAMPILKAN GRAFIK CANDLESTICK
         ch = result["frames"]["15m"].tail(100)
@@ -587,7 +599,7 @@ else:
         st.plotly_chart(fig, use_container_width=True)
 
         # 2. TAMPILKAN ANALYST TEAM
-        st.markdown("### 🧩 SMC Analyst Team")
+        st.markdown("### 🧩 SMC & Momentum Analyst Team")
         cols = st.columns(len(result["analysts"]))
         for col, agent in zip(cols, result["analysts"]):
             with col:
