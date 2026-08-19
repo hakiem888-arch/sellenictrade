@@ -14,11 +14,13 @@ import plotly.graph_objects as go
 from groq import Groq
 
 # ============================================================
-# AI CONSENSUS TRADING V6.0 (SMC EDITION - FULL UI)
+# AI CONSENSUS TRADING V6.0 (SMC EDITION - FULL UI & AUTO ROTATE)
 # - Menggunakan Order Block & Fair Value Gap
 # - Bypass Groq JSON Sensors (Qwen Model)
 # - Dynamic TP/SL Execution
 # - Robust AST JSON Parser + Raw Error Tracker
+# - Auto-Rotate 7+ API Keys
+# - Full Bahasa Indonesia Prompt
 # ============================================================
 
 st.set_page_config(page_title="AI Consensus Trading V6 SMC", page_icon="🧠", layout="wide")
@@ -27,7 +29,7 @@ BINANCE = "https://data-api.binance.vision"
 DB_FILE = "trading_v6.db"
 
 # -------------------------
-# Secrets
+# Secrets & API Key Parsing
 # -------------------------
 def secret(key):
     try:
@@ -47,8 +49,8 @@ _GROQ_KEYS.extend(_parse_secret_list(secret("GROQ_API_KEYS")))
 for _i in range(1, 21):
     _GROQ_KEYS.extend(_parse_secret_list(secret(f"GROQ_API_KEY_{_i}")))
 
+# Menghapus duplikat API Key
 GROQ_KEYS = list(dict.fromkeys(k for k in _GROQ_KEYS if k))
-GROQ_KEY = GROQ_KEYS[0] if GROQ_KEYS else ""
 
 TG_TOKEN = secret("TELEGRAM_BOT_TOKEN")
 TG_CHAT = secret("TELEGRAM_CHAT_ID")
@@ -245,7 +247,7 @@ def scan_markets(n=60):
     return sorted(out, key=lambda x: x["score"], reverse=True)
 
 # -------------------------
-# AI engine — KUNCI QWEN + ROBUST JSON AST PARSER
+# AI engine — KUNCI QWEN + MULTI-KEY ROTATION
 # -------------------------
 ANALYST_MODEL = "qwen/qwen3.6-27b"
 DEBATE_MODEL = "qwen/qwen3.6-27b"
@@ -261,8 +263,6 @@ MODEL_TIERS = {
 
 GROQ_MIN_DELAY = 1.0
 GROQ_RETRY_SECONDS = 15.0
-
-def groq_client(): return Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 
 def compact_json(obj, max_chars=1400):
     if isinstance(obj, dict):
@@ -282,37 +282,21 @@ def compact_json(obj, max_chars=1400):
 
 def _safe_json_from_text(raw):
     raw = (raw or "").strip()
-    if not raw:
-        raise ValueError("Respons AI kosong melompong.")
-        
-    # Pembersihan Markdown ekstrim
-    cleaned = re.sub(r"```[a-zA-Z]*\n?", "", raw)
-    cleaned = cleaned.replace("```", "").strip()
+    if not raw: raise ValueError("Respons AI kosong melompong.")
+    cleaned = re.sub(r"```[a-zA-Z]*\n?", "", raw).replace("```", "").strip()
+    try: return json.loads(cleaned)
+    except Exception: pass
     
-    try: 
-        return json.loads(cleaned)
-    except Exception: 
-        pass
-    
-    # Deteksi kurung kurawal terdalam/terluar
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidate = cleaned[start:end+1]
-        try: 
-            return json.loads(candidate)
-        except Exception:
-            pass
-        
-        # Jurus Pamungkas: AST Literal Eval (mengakali single quotes dari Qwen)
+        try: return json.loads(candidate)
+        except Exception: pass
         try:
             parsed = ast.literal_eval(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-            
-    # Jika gagal total, tampilkan KALIMAT MENTAH Qwen ke layar Anda!
+            if isinstance(parsed, dict): return parsed
+        except Exception: pass
     raise ValueError(f"RAW OUTPUT QWEN: {raw[:300]}...")
 
 def _normalize_ai(obj, tier):
@@ -324,14 +308,10 @@ def _normalize_ai(obj, tier):
     evidence = obj.get("evidence", [])
     if not isinstance(evidence, list): evidence = [str(evidence)] if evidence else []
     return {
-        "decision": decision,
-        "confidence": max(0.0, min(100.0, confidence)),
-        "reasoning": str(obj.get("reasoning", ""))[:700],
-        "key_risk": str(obj.get("key_risk", ""))[:400],
-        "evidence": [str(x)[:180] for x in evidence[:3]],
-        "tp_price": float(obj.get("tp_price", 0.0) or 0.0),
-        "sl_price": float(obj.get("sl_price", 0.0) or 0.0),
-        "tier": tier, "model": MODEL_TIERS[tier]["model"]
+        "decision": decision, "confidence": max(0.0, min(100.0, confidence)),
+        "reasoning": str(obj.get("reasoning", ""))[:700], "key_risk": str(obj.get("key_risk", ""))[:400],
+        "evidence": [str(x)[:180] for x in evidence[:3]], "tp_price": float(obj.get("tp_price", 0.0) or 0.0),
+        "sl_price": float(obj.get("sl_price", 0.0) or 0.0), "tier": tier, "model": MODEL_TIERS[tier]["model"]
     }
 
 def _build_prompt(role, data, instructions):
@@ -340,10 +320,11 @@ TUGAS: {instructions}
 ATURAN WAJIB:
 1. Gunakan data Order Block (OB) dan Fair Value Gap (FVG). Jangan pakai MA/Lagging indicator.
 2. Jika harga belum mencapai OB/FVG, pilih WAIT. Jika harga memitigasi OB, pilih LONG/SHORT.
-3. JAWABAN HARUS BERUPA JSON MURNI TANPA TEKS LAIN SEPERTI "Baik" atau "Ini hasilnya".
-4. Tentukan tp_price dan sl_price berdasarkan batas OB/FVG terdekat (JIKA WAIT, ISI 0.0).
+3. JAWABAN HARUS BERUPA JSON MURNI TANPA TEKS LAIN.
+4. SELURUH TEKS (reasoning, key_risk, evidence) WAJIB DITULIS DALAM BAHASA INDONESIA.
+5. Tentukan tp_price dan sl_price berdasarkan batas OB/FVG terdekat (JIKA WAIT, ISI 0.0).
 CONTOH JSON:
-{{"decision":"LONG","confidence":85,"reasoning":"Harga memitigasi bullish OB.","key_risk":"Tembus support OB.","evidence":["Mitigasi Bull OB di 65000"],"tp_price":66000.0,"sl_price":64500.0}}
+{{"decision":"LONG","confidence":85,"reasoning":"Harga memitigasi bullish OB dan memantul kuat.","key_risk":"Tembus level support OB di bawah.","evidence":["Mitigasi Bull OB di 65000"],"tp_price":66000.0,"sl_price":64500.0}}
 DATA:
 {data}
 """
@@ -355,12 +336,9 @@ def _request_groq(model, prompt, key, max_tokens):
         "messages": [
             {
                 "role": "system",
-                "content": "You are a rigid data API. You output ONLY valid JSON format. NO conversational text. NO markdown formatting. Just the JSON."
+                "content": "You are a rigid data API. You output ONLY valid JSON format. All string values inside the JSON MUST be in Indonesian language (Bahasa Indonesia). NO conversational text. NO markdown formatting."
             },
-            {
-                "role": "user", 
-                "content": prompt
-            }
+            {"role": "user", "content": prompt}
         ],
         "temperature": 0.1,
         "max_tokens": int(max_tokens)
@@ -375,25 +353,43 @@ def call_ai(role, data, instructions, tier="analyst", budget=None):
     max_tokens = budget or cfg["max_tokens"]
     prompt = _build_prompt(role, data, instructions)
     
-    try:
-        last = float(st.session_state.get("_last_ai_call", 0))
-        wait = GROQ_MIN_DELAY - (time.time() - last)
-        if wait > 0: time.sleep(wait)
+    # Inisialisasi index key aktif jika belum ada
+    if "_active_groq_key" not in st.session_state:
+        st.session_state["_active_groq_key"] = 0
         
-        try: raw = _request_groq(cfg["model"], prompt, GROQ_KEYS[0], max_tokens)
-        except Exception as first_error:
-            msg = str(first_error)
-            if "429" in msg or "rate_limit" in msg.lower():
-                time.sleep(GROQ_RETRY_SECONDS)
-                raw = _request_groq(cfg["model"], prompt, GROQ_KEYS[0], max_tokens)
-            else: raise
+    total_keys = len(GROQ_KEYS)
+    start_index = st.session_state["_active_groq_key"] % total_keys
+    
+    # ROTASI OTOMATIS: Coba semua kunci satu per satu jika kena limit
+    for offset in range(total_keys):
+        current_index = (start_index + offset) % total_keys
+        current_key = GROQ_KEYS[current_index]
+        
+        try:
+            last = float(st.session_state.get("_last_ai_call", 0))
+            wait = GROQ_MIN_DELAY - (time.time() - last)
+            if wait > 0: time.sleep(wait)
             
-        st.session_state["_last_ai_call"] = time.time()
-        content = raw.choices[0].message.content or ""
-        obj = _safe_json_from_text(content)
-        return _normalize_ai(obj, tier)
-    except Exception as e:
-        return {"decision": "WAIT", "confidence": 0, "reasoning": str(e), "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
+            raw = _request_groq(cfg["model"], prompt, current_key, max_tokens)
+            
+            st.session_state["_last_ai_call"] = time.time()
+            st.session_state["_active_groq_key"] = current_index # Simpan kunci yang berhasil
+            
+            content = raw.choices[0].message.content or ""
+            obj = _safe_json_from_text(content)
+            return _normalize_ai(obj, tier)
+            
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "rate_limit" in msg.lower() or "quota" in msg.lower() or "billing" in msg.lower():
+                # API Limit tersentuh, lanjutkan iterasi loop untuk pindah ke API Key berikutnya
+                continue 
+            else:
+                # Error format JSON atau lainnya, langsung keluar (bukan karena kuota)
+                return {"decision": "WAIT", "confidence": 0, "reasoning": f"AI error: {msg}", "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
+                
+    # Jika loop selesai dan tidak ada return, berarti 7 kunci semuanya mati/kena limit
+    return {"decision": "WAIT", "confidence": 0, "reasoning": "Seluruh API Key (7 buah) kehabisan kuota atau terkena limit 429.", "key_risk": "Gagal.", "evidence": [], "tp_price": 0.0, "sl_price": 0.0, "tier": tier, "model": cfg["model"]}
 
 # -------------------------
 # Market packet & Data Injector
@@ -545,7 +541,9 @@ if st.sidebar.button("🔄 UPDATE PAPER TRADES", use_container_width=True):
 st.sidebar.divider()
 st.sidebar.header("🤖 AI Status")
 st.sidebar.write("Groq:", "🟢 SIAP" if GROQ_KEYS else "🔴 BELUM ADA")
-if GROQ_KEYS: st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)}")
+if GROQ_KEYS: 
+    aktif = st.session_state.get('_active_groq_key', 0) + 1
+    st.sidebar.caption(f"🔑 API keys terpasang: {len(GROQ_KEYS)} (Memakai Key #{aktif})")
 st.sidebar.caption("Arsitektur V6 SMC:")
 st.sidebar.caption(f"⚡ Analyst: {ANALYST_MODEL}")
 st.sidebar.caption(f"🐂/🐻 Debate: {DEBATE_MODEL}")
