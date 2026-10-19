@@ -48,7 +48,7 @@ from .paper import (
     validate_position_transition,
 )
 
-CURRENT_SCHEMA_VERSION: int = 7
+CURRENT_SCHEMA_VERSION: int = 8
 
 
 def connect_db(
@@ -665,6 +665,159 @@ def _migration_007_lifecycle_risk_and_telegram_outbox(con: sqlite3.Connection) -
     )
 
 
+def _migration_008_autonomous_live_execution(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange TEXT NOT NULL DEFAULT 'BINANCE',
+            market_type TEXT NOT NULL DEFAULT 'FUTURES_USDM',
+            execution_mode TEXT NOT NULL DEFAULT 'PAPER',
+            total_wallet_balance REAL NOT NULL DEFAULT 0.0,
+            available_balance REAL NOT NULL DEFAULT 0.0,
+            account_equity REAL NOT NULL DEFAULT 0.0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0.0,
+            realized_pnl REAL NOT NULL DEFAULT 0.0,
+            used_margin REAL NOT NULL DEFAULT 0.0,
+            available_margin REAL NOT NULL DEFAULT 0.0,
+            open_positions_count INTEGER NOT NULL DEFAULT 0,
+            active_orders_count INTEGER NOT NULL DEFAULT 0,
+            withdrawal_enabled INTEGER DEFAULT 0,
+            sync_ok INTEGER NOT NULL DEFAULT 1,
+            is_consistent INTEGER NOT NULL DEFAULT 1,
+            api_latency_ms REAL DEFAULT 0.0,
+            error_code TEXT DEFAULT '',
+            error_message TEXT DEFAULT '',
+            snapshot_json TEXT,
+            synced_at TEXT NOT NULL
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_account_snapshots_mode ON account_snapshots(execution_mode, synced_at)")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_orders (
+            client_order_id TEXT PRIMARY KEY,
+            exchange_order_id TEXT,
+            signal_id TEXT,
+            position_id TEXT,
+            symbol TEXT NOT NULL,
+            execution_mode TEXT NOT NULL,
+            market_type TEXT NOT NULL DEFAULT 'FUTURES_USDM',
+            order_leg TEXT NOT NULL,
+            side TEXT NOT NULL,
+            order_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            price REAL,
+            stop_price REAL,
+            requested_qty REAL NOT NULL,
+            executed_qty REAL NOT NULL DEFAULT 0.0,
+            avg_fill_price REAL,
+            fee_usd REAL NOT NULL DEFAULT 0.0,
+            reduce_only INTEGER NOT NULL DEFAULT 0,
+            raw_response_json TEXT,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_live_orders_symbol_status ON live_orders(symbol, status)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_live_orders_position ON live_orders(position_id)")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_positions (
+            position_id TEXT PRIMARY KEY,
+            signal_id TEXT,
+            symbol TEXT NOT NULL,
+            execution_mode TEXT NOT NULL,
+            market_type TEXT NOT NULL DEFAULT 'FUTURES_USDM',
+            direction TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL,
+            requested_qty REAL NOT NULL DEFAULT 0.0,
+            open_qty REAL NOT NULL DEFAULT 0.0,
+            closed_qty REAL NOT NULL DEFAULT 0.0,
+            entry_price REAL,
+            avg_entry_fill_price REAL,
+            stop_loss REAL,
+            take_profit REAL,
+            avg_exit_fill_price REAL,
+            notional_value REAL NOT NULL DEFAULT 0.0,
+            used_margin REAL NOT NULL DEFAULT 0.0,
+            leverage REAL NOT NULL DEFAULT 1.0,
+            risk_budget_usd REAL NOT NULL DEFAULT 0.0,
+            realized_pnl_usd REAL NOT NULL DEFAULT 0.0,
+            unrealized_pnl_usd REAL NOT NULL DEFAULT 0.0,
+            total_fees_usd REAL NOT NULL DEFAULT 0.0,
+            entry_client_order_id TEXT,
+            sl_client_order_id TEXT,
+            tp_client_order_id TEXT,
+            exit_client_order_id TEXT,
+            protection_verified INTEGER NOT NULL DEFAULT 0,
+            reconciliation_status TEXT NOT NULL DEFAULT 'OK',
+            reconciliation_detail TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            opened_at TEXT,
+            closed_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_live_positions_state ON live_positions(lifecycle_state)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_live_positions_symbol ON live_positions(symbol, execution_mode)")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+            account_id TEXT PRIMARY KEY,
+            execution_mode TEXT NOT NULL DEFAULT 'PAPER',
+            live_trading_authorized INTEGER NOT NULL DEFAULT 0,
+            kill_switch_active INTEGER NOT NULL DEFAULT 0,
+            kill_switch_reason TEXT DEFAULT '',
+            kill_switch_activated_at TEXT,
+            kill_switch_verification_status TEXT DEFAULT 'IDLE',
+            circuit_breaker_active INTEGER NOT NULL DEFAULT 0,
+            active_reasons_json TEXT DEFAULT '[]',
+            trading_day_utc TEXT NOT NULL,
+            daily_realized_loss_usd REAL NOT NULL DEFAULT 0.0,
+            daily_unrealized_loss_usd REAL NOT NULL DEFAULT 0.0,
+            consecutive_losses INTEGER NOT NULL DEFAULT 0,
+            consecutive_execution_failures INTEGER NOT NULL DEFAULT 0,
+            consecutive_auth_failures INTEGER NOT NULL DEFAULT 0,
+            reconciliation_status TEXT NOT NULL DEFAULT 'OK',
+            last_reconciled_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            execution_mode TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal_id TEXT,
+            position_id TEXT,
+            decision_outcome TEXT NOT NULL,
+            state_before TEXT,
+            state_after TEXT,
+            risk_inputs_json TEXT,
+            order_ids_json TEXT,
+            exchange_response_json TEXT,
+            fills_json TEXT,
+            fees_usd REAL DEFAULT 0.0,
+            reason TEXT DEFAULT ''
+        )
+        """
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_execution_audit_log_sym ON execution_audit_log(symbol, created_at)")
+
+
 MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (1, "001_baseline_and_legacy_provenance", _migration_001_baseline_and_legacy_provenance),
     (2, "002_analysis_and_agent_runs_provenance", _migration_002_analysis_and_agent_runs_provenance),
@@ -673,6 +826,7 @@ MIGRATIONS: List[Tuple[int, str, Callable[[sqlite3.Connection], None]]] = [
     (5, "005_paper_positions_and_ledger", _migration_005_paper_positions_and_ledger),
     (6, "006_monitor_runtime_state", _migration_006_monitor_runtime_state),
     (7, "007_lifecycle_risk_and_telegram_outbox", _migration_007_lifecycle_risk_and_telegram_outbox),
+    (8, "008_autonomous_live_execution", _migration_008_autonomous_live_execution),
 ]
 
 
@@ -3070,5 +3224,502 @@ def mark_telegram_outbox_status(
                 (st_u, safe_err, st_u, now_iso, str(event_key)),
             )
             con.commit()
+        finally:
+            con.close()
+
+
+
+# ---------------------------------------------------------
+# Master Prompt 2: Live/Testnet Account, Orders, Positions, Circuit Breakers & Audit Persistence
+# ---------------------------------------------------------
+_LIVE_EXEC_LOCK = threading.Lock()
+
+
+def save_account_snapshot(
+    snapshot: Dict[str, Any],
+    *,
+    db_file: str = DEFAULT_DB_FILE,
+    extra_secrets: Optional[Iterable[str]] = None,
+) -> int:
+    """Persist an authenticated exchange account snapshot to SQLite (Section 3)."""
+    run_migrations(db_file)
+    now_iso = str(snapshot.get("last_sync_iso") or datetime.now(timezone.utc).isoformat())
+    safe_snap = redact_secrets(snapshot, extra_secrets=extra_secrets)
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            cur = con.execute(
+                """
+                INSERT INTO account_snapshots
+                (exchange, market_type, execution_mode, total_wallet_balance, available_balance,
+                 account_equity, unrealized_pnl, realized_pnl, used_margin, available_margin,
+                 open_positions_count, active_orders_count, withdrawal_enabled, sync_ok,
+                 is_consistent, api_latency_ms, error_code, error_message, snapshot_json, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(safe_snap.get("exchange") or "BINANCE"),
+                    str(safe_snap.get("market_type") or "FUTURES_USDM"),
+                    str(safe_snap.get("execution_mode") or "PAPER"),
+                    float(safe_snap.get("total_wallet_balance") or 0.0),
+                    float(safe_snap.get("available_balance") or 0.0),
+                    float(safe_snap.get("account_equity") or 0.0),
+                    float(safe_snap.get("unrealized_pnl") or 0.0),
+                    float(safe_snap.get("realized_pnl") or 0.0),
+                    float(safe_snap.get("used_margin") or 0.0),
+                    float(safe_snap.get("available_margin") or 0.0),
+                    len(safe_snap.get("open_positions") or []),
+                    len(safe_snap.get("active_orders") or []),
+                    1 if safe_snap.get("withdrawal_enabled") else 0,
+                    1 if safe_snap.get("sync_ok", True) else 0,
+                    1 if safe_snap.get("is_consistent", True) else 0,
+                    float(safe_snap.get("api_latency_ms") or 0.0),
+                    str(safe_snap.get("error_code") or ""),
+                    str(safe_snap.get("error_message") or "")[:400],
+                    json.dumps(safe_snap, ensure_ascii=False, default=str),
+                    now_iso,
+                ),
+            )
+            con.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            con.close()
+
+
+def get_latest_account_snapshot(
+    db_file: str = DEFAULT_DB_FILE,
+    *,
+    execution_mode: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Retrieve the latest persisted exchange account snapshot from SQLite."""
+    run_migrations(db_file)
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            if execution_mode:
+                row = con.execute(
+                    "SELECT * FROM account_snapshots WHERE execution_mode=? ORDER BY id DESC LIMIT 1",
+                    (str(execution_mode).upper().strip(),),
+                ).fetchone()
+            else:
+                row = con.execute("SELECT * FROM account_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+            return dict(row) if row else None
+        finally:
+            con.close()
+
+
+def upsert_live_order(
+    order: Dict[str, Any],
+    *,
+    db_file: str = DEFAULT_DB_FILE,
+    extra_secrets: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Insert or update a live/testnet order record in SQLite with idempotency on `client_order_id` (Section 7)."""
+    run_migrations(db_file)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    safe_o = redact_secrets(order, extra_secrets=extra_secrets)
+    coid = str(safe_o["client_order_id"]).strip()
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            existing = con.execute("SELECT created_at FROM live_orders WHERE client_order_id=? LIMIT 1", (coid,)).fetchone()
+            c_at = str(existing["created_at"]) if existing else str(safe_o.get("created_at") or now_iso)
+            con.execute(
+                """
+                INSERT OR REPLACE INTO live_orders
+                (client_order_id, exchange_order_id, signal_id, position_id, symbol, execution_mode,
+                 market_type, order_leg, side, order_type, status, price, stop_price, requested_qty,
+                 executed_qty, avg_fill_price, fee_usd, reduce_only, raw_response_json, error_message,
+                 created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    coid,
+                    str(safe_o.get("exchange_order_id") or "") or None,
+                    str(safe_o.get("signal_id") or "") or None,
+                    str(safe_o.get("position_id") or "") or None,
+                    str(safe_o.get("symbol") or "UNKNOWN").upper().strip(),
+                    str(safe_o.get("execution_mode") or "TESTNET").upper().strip(),
+                    str(safe_o.get("market_type") or "FUTURES_USDM").upper().strip(),
+                    str(safe_o.get("order_leg") or "ENTRY").upper().strip(),
+                    str(safe_o.get("side") or "BUY").upper().strip(),
+                    str(safe_o.get("order_type") or "MARKET").upper().strip(),
+                    str(safe_o.get("status") or "PENDING_SUBMIT").upper().strip(),
+                    float(safe_o["price"]) if is_finite_number(safe_o.get("price")) else None,
+                    float(safe_o["stop_price"]) if is_finite_number(safe_o.get("stop_price")) else None,
+                    float(safe_o.get("requested_qty") or 0.0),
+                    float(safe_o.get("executed_qty") or 0.0),
+                    float(safe_o["avg_fill_price"]) if is_finite_number(safe_o.get("avg_fill_price")) else None,
+                    float(safe_o.get("fee_usd") or 0.0),
+                    1 if safe_o.get("reduce_only") else 0,
+                    json.dumps(safe_o.get("raw_response") or {}, ensure_ascii=False, default=str),
+                    str(safe_o.get("error_message") or "")[:400],
+                    c_at,
+                    now_iso,
+                ),
+            )
+            con.commit()
+            row = con.execute("SELECT * FROM live_orders WHERE client_order_id=? LIMIT 1", (coid,)).fetchone()
+            return dict(row) if row else {}
+        finally:
+            con.close()
+
+
+def get_live_order(client_order_id: str, db_file: str = DEFAULT_DB_FILE) -> Optional[Dict[str, Any]]:
+    run_migrations(db_file)
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            row = con.execute("SELECT * FROM live_orders WHERE client_order_id=? LIMIT 1", (str(client_order_id),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.close()
+
+
+def list_live_orders(
+    db_file: str = DEFAULT_DB_FILE,
+    *,
+    symbol: Optional[str] = None,
+    active_only: bool = False,
+    execution_mode: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    run_migrations(db_file)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if symbol:
+        clauses.append("symbol=?")
+        params.append(str(symbol).upper().strip())
+    if execution_mode:
+        clauses.append("execution_mode=?")
+        params.append(str(execution_mode).upper().strip())
+    if active_only:
+        clauses.append("status IN ('PENDING_SUBMIT', 'NEW', 'PARTIALLY_FILLED', 'UNCERTAIN_TIMEOUT')")
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            rows = con.execute(f"SELECT * FROM live_orders {where_sql} ORDER BY updated_at DESC", tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.close()
+
+
+def upsert_live_position(
+    position: Dict[str, Any],
+    *,
+    db_file: str = DEFAULT_DB_FILE,
+) -> Dict[str, Any]:
+    """Insert or update a live/testnet position lifecycle record in SQLite, strictly separate from paper_positions (Section 8)."""
+    run_migrations(db_file)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    pid = str(position["position_id"]).strip()
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            existing = con.execute("SELECT created_at, opened_at FROM live_positions WHERE position_id=? LIMIT 1", (pid,)).fetchone()
+            c_at = str(existing["created_at"]) if existing else str(position.get("created_at") or now_iso)
+            o_at = str(position.get("opened_at") or (existing["opened_at"] if existing else "") or "") or None
+            con.execute(
+                """
+                INSERT OR REPLACE INTO live_positions
+                (position_id, signal_id, symbol, execution_mode, market_type, direction,
+                 lifecycle_state, requested_qty, open_qty, closed_qty, entry_price,
+                 avg_entry_fill_price, stop_loss, take_profit, avg_exit_fill_price,
+                 notional_value, used_margin, leverage, risk_budget_usd, realized_pnl_usd,
+                 unrealized_pnl_usd, total_fees_usd, entry_client_order_id, sl_client_order_id,
+                 tp_client_order_id, exit_client_order_id, protection_verified,
+                 reconciliation_status, reconciliation_detail, created_at, opened_at, closed_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pid,
+                    str(position.get("signal_id") or "") or None,
+                    str(position.get("symbol") or "UNKNOWN").upper().strip(),
+                    str(position.get("execution_mode") or "TESTNET").upper().strip(),
+                    str(position.get("market_type") or "FUTURES_USDM").upper().strip(),
+                    str(position.get("direction") or "LONG").upper().strip(),
+                    str(position.get("lifecycle_state") or "ENTRY_REQUESTED").upper().strip(),
+                    float(position.get("requested_qty") or 0.0),
+                    float(position.get("open_qty") or 0.0),
+                    float(position.get("closed_qty") or 0.0),
+                    float(position["entry_price"]) if is_finite_number(position.get("entry_price")) else None,
+                    float(position["avg_entry_fill_price"]) if is_finite_number(position.get("avg_entry_fill_price")) else None,
+                    float(position["stop_loss"]) if is_finite_number(position.get("stop_loss")) else None,
+                    float(position["take_profit"]) if is_finite_number(position.get("take_profit")) else None,
+                    float(position["avg_exit_fill_price"]) if is_finite_number(position.get("avg_exit_fill_price")) else None,
+                    float(position.get("notional_value") or 0.0),
+                    float(position.get("used_margin") or 0.0),
+                    float(position.get("leverage") or 1.0),
+                    float(position.get("risk_budget_usd") or 0.0),
+                    float(position.get("realized_pnl_usd") or 0.0),
+                    float(position.get("unrealized_pnl_usd") or 0.0),
+                    float(position.get("total_fees_usd") or 0.0),
+                    str(position.get("entry_client_order_id") or "") or None,
+                    str(position.get("sl_client_order_id") or "") or None,
+                    str(position.get("tp_client_order_id") or "") or None,
+                    str(position.get("exit_client_order_id") or "") or None,
+                    1 if position.get("protection_verified") else 0,
+                    str(position.get("reconciliation_status") or "OK"),
+                    str(position.get("reconciliation_detail") or "")[:400],
+                    c_at,
+                    o_at,
+                    str(position.get("closed_at") or "") or None,
+                    now_iso,
+                ),
+            )
+            con.commit()
+            row = con.execute("SELECT * FROM live_positions WHERE position_id=? LIMIT 1", (pid,)).fetchone()
+            return dict(row) if row else {}
+        finally:
+            con.close()
+
+
+def get_live_position(position_id: str, db_file: str = DEFAULT_DB_FILE) -> Optional[Dict[str, Any]]:
+    run_migrations(db_file)
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            row = con.execute("SELECT * FROM live_positions WHERE position_id=? LIMIT 1", (str(position_id),)).fetchone()
+            return dict(row) if row else None
+        finally:
+            con.close()
+
+
+def list_live_positions(
+    db_file: str = DEFAULT_DB_FILE,
+    *,
+    open_only: bool = False,
+    execution_mode: Optional[str] = None,
+    symbol: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    run_migrations(db_file)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if open_only:
+        clauses.append(
+            "lifecycle_state NOT IN ('POSITION_CLOSED', 'CANCELED')"
+            " AND (open_qty > 0 OR lifecycle_state IN ('ENTRY_REQUESTED', 'ENTRY_PARTIALLY_FILLED', 'POSITION_OPEN', 'PROTECTIVE_ORDERS_CONFIRMED', 'PROTECTION_MISSING_ALERT', 'RECONCILIATION_REQUIRED'))"
+        )
+    if execution_mode:
+        clauses.append("execution_mode=?")
+        params.append(str(execution_mode).upper().strip())
+    if symbol:
+        clauses.append("symbol=?")
+        params.append(str(symbol).upper().strip())
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            rows = con.execute(f"SELECT * FROM live_positions {where_sql} ORDER BY updated_at DESC", tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.close()
+
+
+def get_circuit_breaker_and_kill_switch_state(
+    db_file: str = DEFAULT_DB_FILE,
+    *,
+    account_id: str = "default",
+    today_utc_str: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Read persistent circuit breaker and kill switch state from SQLite (Section 10 & 11).
+    Automatically handles UTC daily boundary reset for daily realized/unrealized loss counters
+    while preserving active Kill Switch or unresolved reconciliation/protection circuit breakers!
+    """
+    run_migrations(db_file)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    day_prefix = str(today_utc_str or now_iso[:10])
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            row = con.execute(
+                "SELECT * FROM circuit_breaker_state WHERE account_id=? LIMIT 1",
+                (str(account_id),),
+            ).fetchone()
+            if row is None:
+                con.execute(
+                    """
+                    INSERT INTO circuit_breaker_state
+                    (account_id, execution_mode, live_trading_authorized, kill_switch_active,
+                     circuit_breaker_active, active_reasons_json, trading_day_utc, updated_at)
+                    VALUES (?, 'PAPER', 0, 0, 0, '[]', ?, ?)
+                    """,
+                    (str(account_id), day_prefix, now_iso),
+                )
+                con.commit()
+                row = con.execute(
+                    "SELECT * FROM circuit_breaker_state WHERE account_id=? LIMIT 1",
+                    (str(account_id),),
+                ).fetchone()
+            data = dict(row) if row else {}
+            if data.get("trading_day_utc") != day_prefix:
+                # Reset daily loss counters ONLY when the UTC date changes; preserve kill_switch_active
+                con.execute(
+                    """
+                    UPDATE circuit_breaker_state
+                    SET trading_day_utc=?, daily_realized_loss_usd=0.0, daily_unrealized_loss_usd=0.0, updated_at=?
+                    WHERE account_id=?
+                    """,
+                    (day_prefix, now_iso, str(account_id)),
+                )
+                con.commit()
+                row = con.execute(
+                    "SELECT * FROM circuit_breaker_state WHERE account_id=? LIMIT 1",
+                    (str(account_id),),
+                ).fetchone()
+                data = dict(row) if row else {}
+            try:
+                reasons = json.loads(data.get("active_reasons_json") or "[]")
+            except Exception:
+                reasons = []
+            data["active_reasons"] = reasons if isinstance(reasons, list) else []
+            data["kill_switch_active"] = bool(data.get("kill_switch_active"))
+            data["circuit_breaker_active"] = bool(data.get("circuit_breaker_active"))
+            data["live_trading_authorized"] = bool(data.get("live_trading_authorized"))
+            return data
+        finally:
+            con.close()
+
+
+def update_circuit_breaker_and_kill_switch_state(
+    updates: Dict[str, Any],
+    *,
+    db_file: str = DEFAULT_DB_FILE,
+    account_id: str = "default",
+) -> Dict[str, Any]:
+    """Atomically update persistent circuit breaker and kill switch state in SQLite."""
+    current = get_circuit_breaker_and_kill_switch_state(db_file=db_file, account_id=account_id, today_utc_str=(updates or {}).get("trading_day_utc"))
+    now_iso = datetime.now(timezone.utc).isoformat()
+    merged = dict(current)
+    merged.update(updates or {})
+    reasons = merged.get("active_reasons", [])
+    if isinstance(reasons, (list, tuple)):
+        reasons_json = json.dumps(list(dict.fromkeys(str(r) for r in reasons if r)), ensure_ascii=False)
+    else:
+        reasons_json = str(merged.get("active_reasons_json") or "[]")
+
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            con.execute(
+                """
+                UPDATE circuit_breaker_state
+                SET execution_mode=?,
+                    live_trading_authorized=?,
+                    kill_switch_active=?,
+                    kill_switch_reason=?,
+                    kill_switch_activated_at=?,
+                    kill_switch_verification_status=?,
+                    circuit_breaker_active=?,
+                    active_reasons_json=?,
+                    trading_day_utc=?,
+                    daily_realized_loss_usd=?,
+                    daily_unrealized_loss_usd=?,
+                    consecutive_losses=?,
+                    consecutive_execution_failures=?,
+                    consecutive_auth_failures=?,
+                    reconciliation_status=?,
+                    last_reconciled_at=?,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (
+                    str(merged.get("execution_mode") or "PAPER").upper().strip(),
+                    1 if merged.get("live_trading_authorized") else 0,
+                    1 if merged.get("kill_switch_active") else 0,
+                    str(merged.get("kill_switch_reason") or "")[:400],
+                    merged.get("kill_switch_activated_at"),
+                    str(merged.get("kill_switch_verification_status") or "IDLE"),
+                    1 if merged.get("circuit_breaker_active") else 0,
+                    reasons_json,
+                    str(merged.get("trading_day_utc") or now_iso[:10]),
+                    float(merged.get("daily_realized_loss_usd") or 0.0),
+                    float(merged.get("daily_unrealized_loss_usd") or 0.0),
+                    int(merged.get("consecutive_losses") or 0),
+                    int(merged.get("consecutive_execution_failures") or 0),
+                    int(merged.get("consecutive_auth_failures") or 0),
+                    str(merged.get("reconciliation_status") or "OK"),
+                    merged.get("last_reconciled_at"),
+                    now_iso,
+                    str(account_id),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+    return get_circuit_breaker_and_kill_switch_state(db_file=db_file, account_id=account_id, today_utc_str=(updates or {}).get("trading_day_utc"))
+
+
+def append_execution_audit_log(
+    entry: Dict[str, Any],
+    *,
+    db_file: str = DEFAULT_DB_FILE,
+    extra_secrets: Optional[Iterable[str]] = None,
+) -> int:
+    """
+    Append a structured, secret-redacted audit log record for every trading decision,
+    risk calculation, order submission, fill, protective order check, reconciliation,
+    circuit breaker, or kill switch event (Section 1.10 & Section 14).
+    """
+    run_migrations(db_file)
+    now_iso = str(entry.get("created_at") or datetime.now(timezone.utc).isoformat())
+    safe_e = redact_secrets(entry, extra_secrets=extra_secrets)
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            cur = con.execute(
+                """
+                INSERT INTO execution_audit_log
+                (created_at, event_type, execution_mode, symbol, signal_id, position_id,
+                 decision_outcome, state_before, state_after, risk_inputs_json, order_ids_json,
+                 exchange_response_json, fills_json, fees_usd, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_iso,
+                    str(safe_e.get("event_type") or "DECISION_AUDIT").upper().strip(),
+                    str(safe_e.get("execution_mode") or "PAPER").upper().strip(),
+                    str(safe_e.get("symbol") or "SYSTEM").upper().strip(),
+                    str(safe_e.get("signal_id") or "") or None,
+                    str(safe_e.get("position_id") or "") or None,
+                    str(safe_e.get("decision_outcome") or "RECORDED").upper().strip(),
+                    str(safe_e.get("state_before") or "") or None,
+                    str(safe_e.get("state_after") or "") or None,
+                    json.dumps(safe_e.get("risk_inputs") or {}, ensure_ascii=False, default=str),
+                    json.dumps(safe_e.get("order_ids") or {}, ensure_ascii=False, default=str),
+                    json.dumps(safe_e.get("exchange_response") or {}, ensure_ascii=False, default=str),
+                    json.dumps(safe_e.get("fills") or [], ensure_ascii=False, default=str),
+                    float(safe_e.get("fees_usd") or 0.0),
+                    str(safe_e.get("reason") or "")[:500],
+                ),
+            )
+            con.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            con.close()
+
+
+def list_execution_audit_logs(
+    db_file: str = DEFAULT_DB_FILE,
+    *,
+    limit: int = 100,
+    symbol: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    run_migrations(db_file)
+    with _LIVE_EXEC_LOCK:
+        con = connect_db(db_file)
+        try:
+            if symbol:
+                rows = con.execute(
+                    "SELECT * FROM execution_audit_log WHERE symbol=? ORDER BY id DESC LIMIT ?",
+                    (str(symbol).upper().strip(), int(limit)),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT * FROM execution_audit_log ORDER BY id DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+            return [dict(r) for r in rows]
         finally:
             con.close()

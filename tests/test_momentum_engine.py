@@ -679,7 +679,7 @@ class TestMomentumEngineRegression(unittest.TestCase):
 
     def test_database_restart_recovery_and_migration_v7(self):
         from ai_consensus.storage import CURRENT_SCHEMA_VERSION, connect_db, record_risk_guard_rejection
-        self.assertEqual(CURRENT_SCHEMA_VERSION, 7)
+        self.assertGreaterEqual(CURRENT_SCHEMA_VERSION, 8)
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "restart_v7.db")
             run_migrations(db_path)

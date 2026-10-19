@@ -341,3 +341,152 @@ def validate_deployment_security(
         "veto_code": "UNKNOWN_DEPLOYMENT_MODE",
         "reason": f"Mode deployment tidak dikenal: {target_mode}",
     }
+
+
+# ---------------------------------------------------------
+# Master Prompt 2: Autonomous Live Trading & Exchange Config
+# ---------------------------------------------------------
+DEFAULT_EXECUTION_MODE: str = "PAPER"  # PAPER | TESTNET | LIVE
+DEFAULT_LIVE_TRADING_ENABLED: bool = False
+DEFAULT_EXCHANGE_MARKET_TYPE: str = "FUTURES_USDM"  # SPOT | FUTURES_USDM
+DEFAULT_BINANCE_SPOT_URL: str = "https://api.binance.com"
+DEFAULT_BINANCE_SPOT_TESTNET_URL: str = "https://testnet.binance.vision"
+DEFAULT_BINANCE_FUTURES_URL: str = "https://fapi.binance.com"
+DEFAULT_BINANCE_FUTURES_TESTNET_URL: str = "https://testnet.binancefuture.com"
+DEFAULT_MAX_ACCOUNT_FRESHNESS_SECONDS: float = 60.0
+DEFAULT_MAX_LEVERAGE: float = 5.0
+DEFAULT_EMERGENCY_CLOSE_ON_UNPROTECTED: bool = False
+DEFAULT_KILL_SWITCH_CANCEL_UNFILLED_ENTRIES: bool = True
+DEFAULT_KILL_SWITCH_PRESERVE_PROTECTIVE_ORDERS: bool = True
+
+
+def _parse_bool_env(val: Any, default: bool = False) -> bool:
+    if val is None or val == "":
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def get_exchange_credentials(
+    execution_mode: str = "PAPER",
+    getter: Optional[Callable[[str], Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Retrieve exchange API credentials from environment variables without ever mixing
+    TESTNET and LIVE credentials or exposing raw secrets in logs/UI (Section 4).
+    """
+    get = getter or (lambda k: os.getenv(k, ""))
+    mode_u = str(execution_mode or get("EXECUTION_MODE") or DEFAULT_EXECUTION_MODE).upper().strip()
+    if mode_u not in {"PAPER", "TESTNET", "LIVE"}:
+        mode_u = "PAPER"
+
+    if mode_u == "TESTNET":
+        api_key = str(get("BINANCE_TESTNET_API_KEY") or "").strip()
+        api_secret = str(get("BINANCE_TESTNET_API_SECRET") or "").strip()
+        cred_source = "BINANCE_TESTNET_API_KEY"
+    elif mode_u == "LIVE":
+        api_key = str(get("BINANCE_API_KEY") or "").strip()
+        api_secret = str(get("BINANCE_API_SECRET") or "").strip()
+        cred_source = "BINANCE_API_KEY"
+    else:
+        # PAPER mode can still optionally read testnet/live read-only keys if explicitly requested,
+        # but defaults to unauthenticated paper simulation.
+        api_key = str(get("BINANCE_TESTNET_API_KEY") or get("BINANCE_API_KEY") or "").strip()
+        api_secret = str(get("BINANCE_TESTNET_API_SECRET") or get("BINANCE_API_SECRET") or "").strip()
+        cred_source = "OPTIONAL_PAPER_READONLY"
+
+    has_credentials = bool(api_key and api_secret)
+    return {
+        "execution_mode": mode_u,
+        "credential_source": cred_source,
+        "has_credentials": has_credentials,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "api_key_masked": mask_secret(api_key),
+        "extra_secrets": [s for s in (api_key, api_secret) if s],
+    }
+
+
+def resolve_execution_mode_config(
+    getter: Optional[Callable[[str], Any]] = None,
+    *,
+    runtime_live_confirmed: bool = False,
+    kill_switch_active: bool = False,
+) -> Dict[str, Any]:
+    """
+    Resolve autonomous execution mode policy (Section 9):
+    - Defaults strictly to EXECUTION_MODE=PAPER and LIVE_TRADING_ENABLED=false.
+    - Never switches automatically from PAPER or TESTNET to LIVE.
+    - LIVE execution requires BOTH config-level (`EXECUTION_MODE=LIVE` and `LIVE_TRADING_ENABLED=true`)
+      AND explicit user runtime activation (`runtime_live_confirmed=True`) with Kill Switch inactive.
+    """
+    get = getter or (lambda k: os.getenv(k, ""))
+    raw_mode = str(get("EXECUTION_MODE") or DEFAULT_EXECUTION_MODE).upper().strip()
+    if raw_mode not in {"PAPER", "TESTNET", "LIVE"}:
+        raw_mode = "PAPER"
+
+    live_cfg_flag = _parse_bool_env(get("LIVE_TRADING_ENABLED"), default=DEFAULT_LIVE_TRADING_ENABLED)
+    testnet_cfg_flag = _parse_bool_env(get("TESTNET_TRADING_ENABLED"), default=(raw_mode == "TESTNET"))
+    market_type = str(get("EXCHANGE_MARKET_TYPE") or DEFAULT_EXCHANGE_MARKET_TYPE).upper().strip()
+    if market_type not in {"SPOT", "FUTURES_USDM"}:
+        market_type = DEFAULT_EXCHANGE_MARKET_TYPE
+
+    emergency_close = _parse_bool_env(
+        get("EMERGENCY_CLOSE_ON_UNPROTECTED"),
+        default=DEFAULT_EMERGENCY_CLOSE_ON_UNPROTECTED,
+    )
+    cancel_unfilled = _parse_bool_env(
+        get("KILL_SWITCH_CANCEL_UNFILLED_ENTRIES"),
+        default=DEFAULT_KILL_SWITCH_CANCEL_UNFILLED_ENTRIES,
+    )
+    preserve_protective = _parse_bool_env(
+        get("KILL_SWITCH_PRESERVE_PROTECTIVE_ORDERS"),
+        default=DEFAULT_KILL_SWITCH_PRESERVE_PROTECTIVE_ORDERS,
+    )
+    max_acct_age = float(get("MAX_ACCOUNT_FRESHNESS_SECONDS") or DEFAULT_MAX_ACCOUNT_FRESHNESS_SECONDS)
+    max_lev = float(get("MAX_PERMITTED_LEVERAGE") or DEFAULT_MAX_LEVERAGE)
+
+    live_authorized = bool(
+        raw_mode == "LIVE"
+        and live_cfg_flag
+        and runtime_live_confirmed
+        and not kill_switch_active
+    )
+    testnet_authorized = bool(
+        raw_mode == "TESTNET"
+        and testnet_cfg_flag
+        and not kill_switch_active
+    )
+
+    if raw_mode == "LIVE" and not live_authorized:
+        auth_status = "BLOCKED_AWAITING_EXPLICIT_AUTHORIZATION"
+    elif raw_mode == "LIVE" and live_authorized:
+        auth_status = "LIVE_AUTHORIZED"
+    elif raw_mode == "TESTNET" and testnet_authorized:
+        auth_status = "TESTNET_AUTHORIZED"
+    elif raw_mode == "TESTNET":
+        auth_status = "TESTNET_DISABLED"
+    else:
+        auth_status = "PAPER_SIMULATION_ONLY"
+
+    return {
+        "execution_mode": raw_mode,
+        "market_type": market_type,
+        "live_trading_enabled_config": live_cfg_flag,
+        "runtime_live_confirmed": bool(runtime_live_confirmed),
+        "live_execution_authorized": live_authorized,
+        "testnet_execution_authorized": testnet_authorized,
+        "kill_switch_active": bool(kill_switch_active),
+        "authorization_status": auth_status,
+        "max_account_freshness_seconds": max_acct_age,
+        "max_permitted_leverage": max_lev,
+        "emergency_close_on_unprotected": emergency_close,
+        "kill_switch_cancel_unfilled_entries": cancel_unfilled,
+        "kill_switch_preserve_protective_orders": preserve_protective,
+    }

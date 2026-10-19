@@ -410,6 +410,18 @@ def compute_position_sizing(
     max_correlated_positions: int = 100,
     correlated_open_notional: float = 0.0,
     max_correlated_exposure_pct: float = 1.0,
+    available_margin: Optional[float] = None,
+    max_leverage: float = 20.0,
+    max_qty: float = 0.0,
+    contract_type: str = "LINEAR",
+    daily_unrealized_loss_usd: float = 0.0,
+    account_sync_ok: bool = True,
+    account_is_fresh: bool = True,
+    circuit_breaker_active: bool = False,
+    kill_switch_active: bool = False,
+    reconciliation_ok: bool = True,
+    require_instrument_metadata: bool = False,
+    instrument_metadata_available: bool = True,
 ) -> PositionSizingResult:
     """
     Deterministic position sizing with exchange constraint enforcement and Risk Guard checks (Phase 3.1..3.3).
@@ -550,9 +562,26 @@ def compute_position_sizing(
     if stop_dist <= 1e-12:
         return _invalid(["ZERO_STOP_DISTANCE", "INVALID_SL_TP"])
 
-    # Portfolio & Risk Guard limit checks (Phase 3.2)
+    # Operational & Account Intelligence gates (Master Prompt 2 Section 3, 5, 10, 11)
+    if kill_switch_active:
+        vetoes.append("KILL_SWITCH_ACTIVE")
+    if circuit_breaker_active:
+        vetoes.append("CIRCUIT_BREAKER_ACTIVE")
+    if not account_sync_ok:
+        vetoes.append("ACCOUNT_SYNC_FAILED")
+    if not account_is_fresh:
+        vetoes.append("STALE_ACCOUNT_BALANCE")
+    if not reconciliation_ok:
+        vetoes.append("RECONCILIATION_MISMATCH")
+    if require_instrument_metadata and not instrument_metadata_available:
+        vetoes.append("MISSING_INSTRUMENT_METADATA")
+    if float(leverage) > float(max_leverage) + 1e-9 and float(max_leverage) > 0:
+        vetoes.append("MAX_LEVERAGE_EXCEEDED")
+
+    # Portfolio & Risk Guard limit checks (Phase 3.2 + Master Prompt 2 realized + unrealized daily loss)
     max_daily_loss_usd = eq_f * float(max_daily_loss_fraction)
-    if float(daily_realized_loss_usd) >= max_daily_loss_usd - 1e-9 and max_daily_loss_usd > 0:
+    combined_daily_loss_usd = max(0.0, float(daily_realized_loss_usd or 0.0)) + max(0.0, float(daily_unrealized_loss_usd or 0.0))
+    if combined_daily_loss_usd >= max_daily_loss_usd - 1e-9 and max_daily_loss_usd > 0:
         vetoes.append("MAX_DAILY_LOSS_BREACHED")
 
     if int(consecutive_losses) >= int(max_consecutive_losses) and int(max_consecutive_losses) > 0:
@@ -560,13 +589,23 @@ def compute_position_sizing(
 
     risk_budget = eq_f * rf_f
     total_cost_pct = fee_rt + slip_rt + spread_f
-    unit_fee = entry_f * mult_f * (fee_rt / 100.0)
-    unit_slip_spread = entry_f * mult_f * ((slip_rt + spread_f) / 100.0)
-    unit_cost = unit_fee + unit_slip_spread
+    ctype_norm = str(contract_type or "LINEAR").upper().strip()
+    if ctype_norm in {"INVERSE", "INVERSE_PERPETUAL", "COIN_M"}:
+        # Inverse contract: 1 contract = mult_f USD notional; USD PnL per contract = mult_f * entry_f * |1/entry_f - 1/price|
+        unit_notional_ref = mult_f
+        unit_fee = unit_notional_ref * (fee_rt / 100.0)
+        unit_slip_spread = unit_notional_ref * ((slip_rt + spread_f) / 100.0)
+        unit_cost = unit_fee + unit_slip_spread
+        unit_risk_gross = mult_f * entry_f * abs((1.0 / entry_f) - (1.0 / sl_f))
+        unit_reward_gross = mult_f * entry_f * abs((1.0 / entry_f) - (1.0 / tp_f))
+    else:
+        unit_fee = entry_f * mult_f * (fee_rt / 100.0)
+        unit_slip_spread = entry_f * mult_f * ((slip_rt + spread_f) / 100.0)
+        unit_cost = unit_fee + unit_slip_spread
+        unit_risk_gross = stop_dist * mult_f
+        unit_reward_gross = target_dist * mult_f
 
-    unit_risk_gross = stop_dist * mult_f
     unit_risk_net = unit_risk_gross + unit_cost
-    unit_reward_gross = target_dist * mult_f
     unit_reward_net = unit_reward_gross - unit_cost
 
     gross_rr = unit_reward_gross / unit_risk_gross
@@ -600,7 +639,13 @@ def compute_position_sizing(
     remaining_tot_notional = max(0.0, min(free_equity_before * inst.leverage, max_tot_notional - float(current_open_notional)))
     remaining_corr_notional = max(0.0, max_corr_notional - float(correlated_open_notional))
 
-    unit_notional = entry_f * mult_f
+    unit_notional = mult_f if str(contract_type or "LINEAR").upper().strip() in {"INVERSE", "INVERSE_PERPETUAL", "COIN_M"} else (entry_f * mult_f)
+    if available_margin is not None and is_finite_number(available_margin):
+        avail_m = max(0.0, float(available_margin))
+        free_equity_before = min(free_equity_before, avail_m)
+        remaining_tot_notional = max(0.0, min(avail_m * inst.leverage, max_tot_notional - float(current_open_notional)))
+        if avail_m <= 1e-9:
+            vetoes.append("INSUFFICIENT_AVAILABLE_MARGIN")
     max_qty_pos_cap = max_pos_notional / unit_notional
     max_qty_tot_cap = remaining_tot_notional / unit_notional
     max_qty_corr_cap = remaining_corr_notional / unit_notional
@@ -644,6 +689,12 @@ def compute_position_sizing(
         elif min_notional_f > 0.0 and (final_qty * unit_notional) < min_notional_f - 1e-9:
             vetoes.append("BELOW_MIN_NOTIONAL")
             final_qty = 0.0
+        elif float(max_qty or 0.0) > 0.0 and final_qty > float(max_qty) + 1e-12:
+            if cap_position_to_exposure_limit:
+                final_qty = floor_quantity_to_lot(float(max_qty), lot_f) if lot_f > 0.0 else float(max_qty)
+            else:
+                vetoes.append("ABOVE_MAX_ORDER_SIZE")
+                final_qty = 0.0
 
     notional_val = final_qty * unit_notional
     margin_req = notional_val / max(1.0, inst.leverage)
@@ -770,6 +821,19 @@ RISK_VETO_EXPLANATIONS: Dict[str, str] = {
     "MALFORMED_CANDLES": "Data candle OHLCV tidak valid atau rusak.",
     "INCOMPLETE_CANDLE": "Candle referensi belum tertutup (unclosed candle).",
     "SPREAD_TOO_WIDE": "Spread order book terlalu lebar melebihi batas aman.",
+    "KILL_SWITCH_ACTIVE": "Kill Switch aktif — seluruh pembukaan posisi dan pengiriman order baru dihentikan.",
+    "CIRCUIT_BREAKER_ACTIVE": "Risk Circuit Breaker aktif karena pelanggaran batas risiko atau anomali operasional.",
+    "ACCOUNT_SYNC_FAILED": "Sinkronisasi saldo dan posisi akun exchange gagal — entry live diblokir.",
+    "STALE_ACCOUNT_BALANCE": "Data saldo akun exchange telah kedaluwarsa (melebihi batas umur data maksimum).",
+    "INCONSISTENT_ACCOUNT_DATA": "Data saldo/margin yang dilaporkan exchange tidak konsisten.",
+    "RECONCILIATION_MISMATCH": "Terdapat ketidaksesuaian posisi/order antara database lokal dan exchange.",
+    "MISSING_INSTRUMENT_METADATA": "Metadata presisi instrumen exchange (tick/lot/min_notional) belum tersedia.",
+    "MAX_LEVERAGE_EXCEEDED": "Leverage yang diminta melebihi batas leverage maksimum yang diizinkan.",
+    "INSUFFICIENT_AVAILABLE_MARGIN": "Available margin pada akun exchange tidak mencukupi untuk membuka posisi.",
+    "ABOVE_MAX_ORDER_SIZE": "Kuantitas posisi melebihi batas maksimum ukuran order bursa (max_qty).",
+    "LIVE_TRADING_DISABLED": "Eksekusi order live dinonaktifkan secara default atau belum diotorisasi.",
+    "MISSING_PROTECTIVE_ORDER": "Order protektif Stop-Loss belum terkonfirmasi pada posisi terbuka.",
+    "AI_CANNOT_WIDEN_STOP_LOSS": "AI dilarang memperlebar jarak Stop-Loss atau mengurangi proteksi risiko.",
 }
 
 
@@ -1355,4 +1419,149 @@ def build_trade_plan_and_sizing(
         "sizing": sizing.to_dict(),
         "veto_codes": list(sizing.veto_codes),
         "rejection_reasons": explain_risk_veto_codes(sizing.veto_codes),
+    }
+
+
+def evaluate_dynamic_protective_levels(
+    direction: str,
+    entry_price: float,
+    current_stop_loss: float,
+    current_take_profit: float,
+    current_market_price: float,
+    *,
+    atr: float = 0.0,
+    tick_size: float = 0.0,
+    fee_pct_round_trip: float = 0.08,
+    slippage_pct_round_trip: float = 0.04,
+    min_net_rr: float = 1.5,
+    enable_break_even: bool = True,
+    break_even_trigger_r: float = 1.0,
+    break_even_offset_r: float = 0.05,
+    enable_trailing_stop: bool = False,
+    trailing_atr_mult: float = 1.5,
+    proposed_stop_loss: Optional[float] = None,
+    proposed_take_profit: Optional[float] = None,
+    proposed_by_ai: bool = False,
+) -> Dict[str, Any]:
+    """
+    Deterministic validation and management of dynamic Stop-Loss and Take-Profit levels (Section 6):
+    - Validates directional geometry, tick precision, net R:R, and cost coverage.
+    - NEVER moves a stop-loss farther away from entry (never widens risk to prevent a position from closing).
+    - Rejects any AI-proposed stop-loss or take-profit change that loosens risk protection or fails validation.
+    - Supports deterministic, testable break-even and ATR trailing stop adjustments when favorable price excursion occurs.
+    """
+    dir_norm = str(direction or "WAIT").upper().strip()
+    veto_codes: List[str] = []
+
+    if dir_norm not in {"LONG", "SHORT"}:
+        return {"valid": False, "veto_codes": ["WAIT_DECISION"], "stop_loss": None, "take_profit": None, "action": "NONE"}
+
+    for v in (entry_price, current_stop_loss, current_take_profit, current_market_price):
+        if not is_finite_number(v) or float(v) <= 0.0:
+            return {"valid": False, "veto_codes": ["NON_POSITIVE_PRICE", "INVALID_SL_TP"], "stop_loss": None, "take_profit": None, "action": "REJECTED"}
+
+    entry_f = round_price_to_tick(float(entry_price), tick_size)
+    curr_sl_f = round_price_to_tick(float(current_stop_loss), tick_size)
+    curr_tp_f = round_price_to_tick(float(current_take_profit), tick_size)
+    mkt_f = float(current_market_price)
+
+    base_rr = compute_directional_risk_reward(dir_norm, entry_f, curr_sl_f, curr_tp_f)
+    if not base_rr["valid"]:
+        return {
+            "valid": False,
+            "veto_codes": list(base_rr["veto_codes"]),
+            "stop_loss": curr_sl_f,
+            "take_profit": curr_tp_f,
+            "action": "REJECTED",
+        }
+
+    initial_risk = abs(entry_f - curr_sl_f)
+    new_sl = curr_sl_f
+    new_tp = curr_tp_f
+    action = "KEEP_EXISTING"
+
+    # Evaluate explicit proposed stop-loss / take-profit (e.g. from AI or manual update)
+    if proposed_stop_loss is not None:
+        if not is_finite_number(proposed_stop_loss) or float(proposed_stop_loss) <= 0.0:
+            veto_codes.append("NON_POSITIVE_PRICE")
+        else:
+            prop_sl = round_price_to_tick(float(proposed_stop_loss), tick_size)
+            if dir_norm == "LONG":
+                # Moving SL lower for LONG widens risk — strictly prohibited!
+                if prop_sl < curr_sl_f - 1e-9:
+                    veto_codes.append("AI_CANNOT_WIDEN_STOP_LOSS" if proposed_by_ai else "STOP_LOSS_WIDENING_PROHIBITED")
+                elif prop_sl >= mkt_f:
+                    veto_codes.append("STOP_LOSS_ABOVE_CURRENT_MARKET")
+                else:
+                    new_sl = prop_sl
+                    action = "TIGHTEN_STOP_LOSS"
+            else:
+                # Moving SL higher for SHORT widens risk — strictly prohibited!
+                if prop_sl > curr_sl_f + 1e-9:
+                    veto_codes.append("AI_CANNOT_WIDEN_STOP_LOSS" if proposed_by_ai else "STOP_LOSS_WIDENING_PROHIBITED")
+                elif prop_sl <= mkt_f:
+                    veto_codes.append("STOP_LOSS_BELOW_CURRENT_MARKET")
+                else:
+                    new_sl = prop_sl
+                    action = "TIGHTEN_STOP_LOSS"
+
+    if proposed_take_profit is not None:
+        if not is_finite_number(proposed_take_profit) or float(proposed_take_profit) <= 0.0:
+            veto_codes.append("NON_POSITIVE_PRICE")
+        else:
+            prop_tp = round_price_to_tick(float(proposed_take_profit), tick_size)
+            if (dir_norm == "LONG" and prop_tp <= entry_f) or (dir_norm == "SHORT" and prop_tp >= entry_f):
+                veto_codes.append("INVALID_SL_TP")
+            else:
+                new_tp = prop_tp
+
+    if veto_codes:
+        return {
+            "valid": False,
+            "veto_codes": veto_codes,
+            "stop_loss": curr_sl_f,
+            "take_profit": curr_tp_f,
+            "action": "REJECTED",
+            "reasons": explain_risk_veto_codes(veto_codes),
+        }
+
+    # Deterministic break-even & trailing stop rules (only tighten protection, never loosen)
+    if initial_risk > 1e-12:
+        if dir_norm == "LONG":
+            favorable_excursion = mkt_f - entry_f
+            if enable_break_even and favorable_excursion >= (float(break_even_trigger_r) * initial_risk):
+                cost_buffer = entry_f * ((float(fee_pct_round_trip) + float(slippage_pct_round_trip)) / 100.0)
+                be_sl = round_price_to_tick(entry_f + max(cost_buffer, float(break_even_offset_r) * initial_risk), tick_size)
+                if be_sl > new_sl and be_sl < mkt_f:
+                    new_sl = be_sl
+                    action = "MOVE_TO_BREAK_EVEN"
+            if enable_trailing_stop and is_finite_number(atr) and float(atr) > 0.0:
+                trail_sl = round_price_to_tick(mkt_f - float(trailing_atr_mult) * float(atr), tick_size)
+                if trail_sl > new_sl and trail_sl < mkt_f:
+                    new_sl = trail_sl
+                    action = "TRAIL_STOP_LOSS"
+        else:
+            favorable_excursion = entry_f - mkt_f
+            if enable_break_even and favorable_excursion >= (float(break_even_trigger_r) * initial_risk):
+                cost_buffer = entry_f * ((float(fee_pct_round_trip) + float(slippage_pct_round_trip)) / 100.0)
+                be_sl = round_price_to_tick(entry_f - max(cost_buffer, float(break_even_offset_r) * initial_risk), tick_size)
+                if be_sl < new_sl and be_sl > mkt_f:
+                    new_sl = be_sl
+                    action = "MOVE_TO_BREAK_EVEN"
+            if enable_trailing_stop and is_finite_number(atr) and float(atr) > 0.0:
+                trail_sl = round_price_to_tick(mkt_f + float(trailing_atr_mult) * float(atr), tick_size)
+                if trail_sl < new_sl and trail_sl > mkt_f:
+                    new_sl = trail_sl
+                    action = "TRAIL_STOP_LOSS"
+
+    return {
+        "valid": True,
+        "veto_codes": [],
+        "direction": dir_norm,
+        "entry": entry_f,
+        "previous_stop_loss": curr_sl_f,
+        "stop_loss": new_sl,
+        "take_profit": new_tp,
+        "action": action,
+        "stop_tightened": bool((dir_norm == "LONG" and new_sl > curr_sl_f) or (dir_norm == "SHORT" and new_sl < curr_sl_f)),
     }

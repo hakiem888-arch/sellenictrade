@@ -39,9 +39,13 @@ from .storage import (
 )
 
 EXECUTION_CLASSIFICATION_BADGES: Dict[str, str] = {
-    "GENERATED_SIGNAL": "[GENERATED SIGNAL — PAPER ANALYSIS ONLY / TIDAK ADA ORDER KE EXCHANGE]",
+    "GENERATED_SIGNAL": "📡 [GENERATED SIGNAL — NOT AN EXECUTED ORDER]",
     "PAPER_TRADE_FILL": "[SIMULATED PAPER-TRADE FILL — SIMULASI INTERNAL / BUKAN EKSEKUSI BURSA]",
-    "LIVE_EXECUTION": "[LIVE EXCHANGE EXECUTION: DISABLED — HANYA PAPER TRADING]",
+    "SUBMITTED_ORDER": "📤 [EXCHANGE ORDER SUBMITTED — AWAITING FILL CONFIRMATION]",
+    "CONFIRMED_EXCHANGE_FILL": "✅ [CONFIRMED EXCHANGE FILL / ACTIVE POSITION]",
+    "CLOSED_TRADE": "🏁 [CLOSED EXCHANGE POSITION — REALIZED PNL RECONCILED]",
+    "EXECUTION_GUARD_ALERT": "🛡️ [RISK GUARD / CIRCUIT BREAKER / KILL SWITCH ALERT]",
+    "LIVE_EXECUTION": "🚫 [LIVE EXECUTION: DISABLED BY DEFAULT UNLESS EXPLICITLY AUTHORIZED]",
 }
 
 
@@ -240,8 +244,26 @@ def format_telegram_event_message(
     ts_str = str(payload.get("timestamp") or payload.get("closed_at") or payload.get("created_at") or datetime.now(timezone.utc).isoformat())[:19].replace("T", " ") + " UTC"
     sig_id = str(payload.get("signal_id") or payload.get("position_id") or payload.get("idempotency_key") or f"evt_{sym}_{ev_norm}")
 
+    exec_mode = str(payload.get("execution_mode") or "PAPER").upper().strip()
+    ord_status = str(payload.get("order_status") or payload.get("status") or sig_state).upper().strip()
+
     if "PAPER_TRADE" in ev_norm:
         badge = EXECUTION_CLASSIFICATION_BADGES["PAPER_TRADE_FILL"]
+    elif ev_norm in {"LIVE_ENTRY_SUBMITTED", "ORDER_SUBMITTED"}:
+        badge = EXECUTION_CLASSIFICATION_BADGES["SUBMITTED_ORDER"]
+    elif ev_norm in {"ENTRY_FILLED_PROTECTED", "ENTRY_PARTIAL_FILL", "EXIT_PARTIAL_FILL", "SL_TP_STATUS_UPDATED"}:
+        badge = EXECUTION_CLASSIFICATION_BADGES["CONFIRMED_EXCHANGE_FILL"]
+    elif ev_norm in {"LIVE_POSITION_CLOSED", "POSITION_CLOSED"}:
+        badge = EXECUTION_CLASSIFICATION_BADGES["CLOSED_TRADE"]
+    elif ev_norm in {
+        "ORDER_REJECTED",
+        "RISK_GUARD_REJECTED",
+        "CIRCUIT_BREAKER_ACTIVATED",
+        "RECONCILIATION_MISMATCH",
+        "CRITICAL_PROTECTION_FAILURE",
+        "KILL_SWITCH_ACTIVATED",
+    }:
+        badge = EXECUTION_CLASSIFICATION_BADGES["EXECUTION_GUARD_ALERT"]
     elif "SYSTEM" in ev_norm:
         badge = EXECUTION_CLASSIFICATION_BADGES["LIVE_EXECUTION"]
     else:
@@ -253,6 +275,8 @@ def format_telegram_event_message(
     inv_v = payload.get("invalidation_level") or sl_v
     exit_v = payload.get("exit_price")
     rr_v = payload.get("net_rr") or payload.get("rr") or payload.get("gross_r_multiple")
+    pos_qty = payload.get("quantity") or payload.get("position_size") or payload.get("open_qty")
+    risk_usd = payload.get("risk_budget") or payload.get("risk_budget_usd") or payload.get("net_pnl")
 
     levels_parts: List[str] = []
     if is_finite_number(entry_v):
@@ -264,7 +288,11 @@ def format_telegram_event_message(
     if is_finite_number(inv_v):
         levels_parts.append(f"Invalidation: ${float(inv_v):,.8f}")
     if is_finite_number(exit_v):
-        levels_parts.append(f"Simulated Exit: ${float(exit_v):,.8f}")
+        levels_parts.append(f"Exit Price: ${float(exit_v):,.8f}")
+    if is_finite_number(pos_qty) and float(pos_qty) > 0:
+        levels_parts.append(f"Position Size: {float(pos_qty):.6f}")
+    if is_finite_number(risk_usd):
+        levels_parts.append(f"Estimated/Realized Risk ($): ${float(risk_usd):,.2f}")
     if is_finite_number(rr_v):
         levels_parts.append(f"R:R / R-Mult: {float(rr_v):+.2f}")
     levels_block = "\n".join(f"• {line}" for line in levels_parts) if levels_parts else "• Risk levels: N/A"
@@ -280,16 +308,22 @@ def format_telegram_event_message(
             f"Net R: {float(payload.get('net_r_multiple', 0.0) or 0.0):+.2f}R"
         )
 
+    footer_note = (
+        f"⚠️ Mode Eksekusi: {exec_mode} | Status Order/Setup: {ord_status}"
+        if exec_mode in {"TESTNET", "LIVE"}
+        else "⚠️ Mode PAPER — simulasi & analisis saja, tidak ada order live ke exchange."
+    )
+
     msg = (
         f"🔔 SECRETAGENT EVENT: {ev_norm}\n"
         f"{badge}\n\n"
-        f"📌 Asset: {sym}\n"
-        f"🧭 Direction: {direction} | Signal State: {sig_state}\n"
+        f"📌 Asset: {sym} | Mode: {exec_mode}\n"
+        f"🧭 Direction: {direction} | State/Status: {ord_status}\n"
         f"⏱️ Timeframe: {tf_str} | Timestamp: {ts_str}\n"
         f"🆔 Event/Signal ID: {sig_id}\n\n"
-        f"📐 Key Risk Levels:\n{levels_block}\n\n"
+        f"📐 Key Risk & Execution Levels:\n{levels_block}\n\n"
         f"📝 Detail:\n{detail}\n\n"
-        f"⚠️ Paper trading & analisis saja — tidak ada order live."
+        f"{footer_note}"
     )
     return sanitize_ui_error(msg, extra_secrets=extra_secrets)
 
