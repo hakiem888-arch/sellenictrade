@@ -1,7 +1,8 @@
-"""Transactional Telegram conversations with ownership and replay protection."""
+"""Transactional Telegram conversations with ownership, replay protection, and autonomous controls."""
 import json
 from decimal import Decimal
 
+from .config import AutonomousConfig
 from .engine import InvalidData, fmt, number, validate_details
 from .store import dumps, record, uid, transition
 from .telegram import keyboard, position_buttons, position_text
@@ -21,8 +22,9 @@ PROMPTS = {
 
 
 class Interactions:
-    def __init__(self, store, config):
+    def __init__(self, store, config, auto_config=None):
         self.store, self.config = store, config
+        self.auto_config = auto_config or AutonomousConfig.load()
         self.bot_id = config.token.split(":", 1)[0]
 
     def process(self, update):
@@ -233,6 +235,48 @@ class Interactions:
                 self._cancel(con, s)
             self.store.queue(con, key, chat, "Percakapan dibatalkan. Jika proses close dibatalkan, posisi tetap PAUSED.")
             return "CANCELLED"
+        if command in {"/killswitch", "/halt"}:
+            now = self.store.clock()
+            ks_val = {"active": True, "mode": "HALT_NEW_ENTRIES", "actor": f"telegram:{user}", "reason": "TELEGRAM_KILL_SWITCH", "activated_at": now}
+            self.store.risk_state("kill_switch", ks_val, con=con)
+            self.store.audit("KILL_SWITCH", "ACTIVATED_TELEGRAM", ks_val, environment=self.auto_config.execution_mode, severity="CRITICAL", con=con)
+            self.store.queue(
+                con, key, chat,
+                "🛑 KILL SWITCH AKTIF (HALT_NEW_ENTRIES)\nSeluruh entry baru diblokir. Order proteksi SL/TP pada posisi terbuka tetap dipertahankan.",
+            )
+            return "KILL_SWITCH_ENGAGED"
+        if command == "/resume_entries":
+            now = self.store.clock()
+            ks_val = {"active": False, "disengaged_by": f"telegram:{user}", "disengaged_at": now}
+            self.store.risk_state("kill_switch", ks_val, con=con)
+            self.store.audit("KILL_SWITCH", "DISENGAGED_TELEGRAM", ks_val, environment=self.auto_config.execution_mode, con=con)
+            self.store.queue(con, key, chat, "🟢 Kill switch dinonaktifkan. Entry baru tetap harus melewati seluruh pemeriksaan kesiapan dan Risk Engine.")
+            return "KILL_SWITCH_DISENGAGED"
+        if command in {"/status", "/account", "/risk"}:
+            env = self.auto_config.execution_mode
+            inst = self.auto_config.default_instrument
+            snap = record(con.execute(
+                "SELECT * FROM at_account_snapshots WHERE environment=? AND instrument=? ORDER BY synced_at DESC LIMIT 1",
+                (env, inst),
+            ).fetchone())
+            ks = self.store.risk_state("kill_switch", default={"active": False}, con=con)
+            breakers = [r["reason"] for r in con.execute("SELECT reason FROM at_circuit_breakers WHERE active=1").fetchall()]
+            open_at = con.execute(
+                "SELECT COUNT(*) AS c FROM at_positions WHERE environment=? AND position_state IN ('OPENING','PROTECTED_ACTIVE','PROTECTION_REQUIRED')",
+                (env,),
+            ).fetchone()["c"]
+            eq_str = snap["account_equity"] if snap else "N/A"
+            avail_str = snap["available_margin"] if snap else "N/A"
+            summary_text = (
+                f"SECRETAGENT V5.5 | STATUS OPERASIONAL\n"
+                f"Mode: {env} ({inst}) | Trailing: {self.auto_config.trailing_mode}\n"
+                f"Equity: {eq_str} USDT | Available Margin: {avail_str} USDT\n"
+                f"Posisi Autonomous Terbuka: {open_at}\n"
+                f"Kill Switch: {'AKTIF' if ks.get('active') else 'NONAKTIF'}\n"
+                f"Circuit Breakers: {', '.join(breakers) if breakers else 'CLEAR'}"
+            )
+            self.store.queue(con, key, chat, summary_text)
+            return "STATUS"
         if command == "/positions":
             rows = con.execute("SELECT * FROM mt_positions WHERE owner_id=? AND chat_id=? ORDER BY created_at DESC LIMIT 20", (user, chat)).fetchall()
             for row in rows:
@@ -246,7 +290,12 @@ class Interactions:
             self.store.queue(con, key, chat, "RIWAYAT TRACKING\n" + ("\n".join(f"Signal {r['source_signal_id']} / {r['id']}: {r['state']}" for r in rows) or "Belum ada."))
             return "HISTORY"
         if command in {"/start", "/help"}:
-            self.store.queue(con, key, chat, "Klik Saya Sudah Entry pada sinyal LONG/SHORT, lalu balas tiap pertanyaan dan konfirmasi. /positions untuk pause/resume/close; /history untuk riwayat; /cancel untuk membatalkan formulir. Semua tindakan exchange tetap manual.")
+            self.store.queue(
+                con, key, chat,
+                "Klik Saya Sudah Entry pada sinyal LONG/SHORT, lalu balas tiap pertanyaan dan konfirmasi. "
+                "/positions untuk pause/resume/close; /history untuk riwayat; /status untuk ringkasan akun & risiko; "
+                "/killswitch untuk menghentikan entry baru; /cancel untuk membatalkan formulir. Semua tindakan manual tetap terlindungi.",
+            )
             return "HELP"
         if not s or s["step"] == "confirm":
             raise ValueError("Tidak ada pertanyaan aktif. Gunakan tombol konfirmasi, /positions, atau /help.")

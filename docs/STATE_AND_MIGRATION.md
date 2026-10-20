@@ -1,69 +1,35 @@
-# State, persistence, dan pemulihan
+# State Machine, Migrasi Database, dan Pemulihan Restart
 
-## State machine
+## 1. Pemisahan State Internal (Fase 1–6)
+Tabel `at_positions` dan `at_orders` memisahkan secara eksplisit lima dimensi status agar tidak pernah menggunakan satu kolom status yang ambigu:
 
-| State sekarang | Pemicu | State berikutnya |
-| --- | --- | --- |
-| SIGNAL_SENT | Entry dari user/chat allowlist dan message ID valid | AWAITING_ENTRY_DETAILS |
-| SIGNAL_SENT / AWAITING_ENTRY_DETAILS | Abaikan oleh pemilik yang sah | IGNORED |
-| AWAITING_ENTRY_DETAILS | Seluruh field valid, metadata segar, SL sesuai tick, konfirmasi akhir | ACTIVE |
-| AWAITING_ENTRY_DETAILS | `/cancel` atau formulir kedaluwarsa | SIGNAL_SENT, tanpa tracker |
-| ACTIVE | Gangguan koneksi, harga basi, candle tidak lengkap | TRACKING_ERROR |
-| ACTIVE / TRACKING_ERROR | Metadata/instrumen atau data posisi tidak valid | INVALID_DATA |
-| TRACKING_ERROR / INVALID_DATA | Harga, candle, dan metadata kembali valid | ACTIVE |
-| ACTIVE / TRACKING_ERROR / INVALID_DATA | Pause eksplisit pemilik | PAUSED |
-| PAUSED | Resume eksplisit pemilik | ACTIVE, menunggu resinkronisasi |
-| ACTIVE / PAUSED / TRACKING_ERROR / INVALID_DATA | Pemilik mulai melaporkan penutupan | EXIT_REPORTED |
-| EXIT_REPORTED | Konfirmasi akhir pemilik | CLOSED |
-| EXIT_REPORTED | Batal atau konfirmasi kedaluwarsa | PAUSED |
-| IGNORED / CLOSED | Tombol entry lama, restart, harga baru | Tidak berubah |
+1. **`signal_state`**: `AUTHORIZED`, `VALIDATED`, `EXTERNAL`
+2. **`order_state`**: `INTENT_PERSISTED`, `SUBMITTING`, `NEW`, `PARTIALLY_FILLED`, `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`, `UNCERTAIN_TIMEOUT`
+3. **`position_state`**: `PENDING_ENTRY`, `OPENING`, `PROTECTED_ACTIVE`, `PROTECTION_REQUIRED`, `CLOSING`, `CLOSED`, `HALTED_DISCREPANCY`
+4. **`protective_order_state`**: `UNPROTECTED`, `SUBMITTING_PROTECTION`, `VERIFIED`, `PARTIAL_COVERAGE`, `PROTECTION_FAILED`, `MODIFICATION_UNCERTAIN`, `CLOSED`
+5. **`account_state`**: `SYNCHRONIZED`, `STALE`, `DISCREPANCY`
 
-State `SIGNAL_SENT` adalah lifecycle sinyal yang diterbitkan ke outbox, **bukan klaim pengiriman sukses**. Keberhasilan kirim harus diperiksa di `mt_outbox.state=SENT` dengan `message_id`. Jika belum terkirim, belum ada interaksi valid yang dapat mengaktifkan posisi.
+State posisi manual di `mt_positions` (`SIGNAL_SENT`, `AWAITING_ENTRY_DETAILS`, `ACTIVE`, `PAUSED`, `TRACKING_ERROR`, `INVALID_DATA`, `EXIT_REPORTED`, `CLOSED`, `IGNORED`) tetap dipertahankan 100%.
 
-Tidak ada transisi dari WAIT ke tracker. Sentuhan level SL hanya event `STOP_TOUCHED`; tidak mengubah ACTIVE menjadi CLOSED. Gangguan harga tidak dapat menutup posisi. State CLOSED selalu menyimpan `closure_source=USER_REPORTED`; harga exit boleh NULL. Tidak ada deteksi fill dari exchange.
+## 2. Migrasi Aditif (`mt_*` & `at_*`)
+Perintah `python3 -m manual_tracker --migrate --db /path/trading_v5.db` membuat salinan backup SQLite konsisten terlebih dahulu, lalu menerapkan skema `mt_schema` versi 1 & 2 secara idempoten (`CREATE TABLE IF NOT EXISTS` tanpa `DROP` atau `DELETE` terhadap tabel legacy `signals`, `paper_positions`, `paper_account_ledger`, maupun tabel `mt_*`).
 
-Sinyal IGNORED terminal. Formulir yang dibatalkan tidak menciptakan tracker. Satu sinyal maksimal satu posisi sepanjang lifecycle, melalui UNIQUE constraint. Permintaan entry dari dua pengguna bersamaan diurutkan oleh transaksi SQLite; hanya pemilik klaim pertama yang dapat melanjutkan.
+Tabel otonom baru (`at_*`):
+- `at_account_snapshots`: Riwayat sinkronisasi saldo dompet, saldo tersedia, ekuitas, PnL belum terealisasi/terealisasi, margin terpakai/tersedia, posisi terbuka, order aktif, izin API, dan status kesehatan.
+- `at_instrument_specs`: Metadata instrumen (`tick_size`, `step_size`, `min_qty`, `max_qty`, `min_notional`, `contract_multiplier`, `max_leverage`, `maker_fee`, `taker_fee`, `funding_rate`).
+- `at_risk_state` & `at_daily_risk_ledger`: Status risiko persisten, penghitung kerugian beruntun, kegagalan eksekusi, aktivasi live pengguna, status Kill Switch, serta buku besar PnL harian dengan batas hari `00:00:00 UTC`.
+- `at_circuit_breakers`: Status circuit breaker persisten lintas restart.
+- `at_orders` & `at_fills`: Jejak siklus hidup order (`client_order_id` unik, `exchange_order_id`, kuantitas diminta vs terisi, harga rata-rata fill, fee).
+- `at_positions`: Status posisi otonom dengan pemisahan lingkungan (`BACKTEST`, `PAPER`, `TESTNET`, `LIVE`) dan pelacakan stop (`initial_stop`, `current_stop`, `recommended_stop`, `last_confirmed_exchange_stop`).
+- `at_reconciliation_log` & `at_audit_events`: Jejak audit lengkap untuk setiap keputusan risiko, niat order, fill, perubahan trailing stop, rekonsiliasi, circuit breaker, dan tindakan operator tanpa pernah mencatat kredensial rahasia.
 
-## Migrasi
-
-Jalankan `python -m manual_tracker --migrate --db /path/trading_v5.db`. Perintah ini membuat backup konsisten terlebih dahulu jika file ada. Simpan path backup yang dicetak. Migrasi sendiri menggunakan transaksi CREATE-only yang idempoten. Tidak ada DROP, DELETE, penggantian database, pengurangan risk gate, atau perubahan schema version legacy oleh modul baru.
-
-| Tabel baru | Isi |
-| --- | --- |
-| `mt_schema` | Versi migrasi fitur manual, terpisah dari schema legacy |
-| `mt_signals` | ID manual, ID sinyal asli, source key, snapshot referensi, chat/pemilik, state, expiry, message ID |
-| `mt_positions` | Detail fill aktual dalam JSON, posisi/status, stop rekomendasi, ekstrem, aktivasi, ATR, harga dan waktu, metrik, event terakhir, penutupan pengguna |
-| `mt_instruments` | Tick terverifikasi, instrumen/simbol, waktu metadata, error metadata |
-| `mt_sessions` | Formulir per user/chat, nonce, tahap, data, expiry, prompt terakhir |
-| `mt_updates` | ID update/callback, bot, hasil, waktu; pencegahan replay |
-| `mt_events` | Jejak transisi, aktivasi, trailing, sentuhan stop, dan registrasi |
-| `mt_outbox` | Isi pesan, message ID, delivery state, retry, expiry, last error |
-| `mt_runtime` | Heartbeat, offset Telegram, identitas bot, cooldown pengiriman |
-
-`mt_positions.details` menyimpan symbol, instrument, direction, entry, quantity, initial_stop, multiplier, leverage, estimasi entry_fee/exit_fee, confirmed_tick, confirmed_at, quote_asset, dan execution_source. Angka uang diserialisasikan sebagai string decimal; perhitungan memakai Decimal. Timestamp runtime berupa epoch detik UTC; tampilan menyertakan UTC. Snapshot sinyal mempertahankan timestamp ISO asli dari v5.5.
-
-Tidak ada foreign key dari tabel manual ke tabel `signals` lama. Ini disengaja: data manual dan snapshot tidak ikut terhapus oleh reset sandbox paper-trading yang sudah ada. Source key menggabungkan ID, waktu penciptaan, dan analysis ID agar sinyal baru setelah reset tidak tertukar dengan posisi lama. Jangan memakai reset sebagai prosedur migrasi.
-
-## Atomicity dan delivery
-
-Perubahan state, pembuatan tracker, event, reply outbox, ID callback, dan offset update dikomit dalam transaksi yang sama. Error database membatalkan transaksi; offset tidak maju. Jaringan tidak dipanggil selama transaksi interaksi. Pengiriman dilakukan loop berbeda dengan claim PENDING → SENDING sebelum HTTP.
-
-Respons sukses mencatat SENT dan ID pesan. Pencatatan `last_notified_stop` hanya terjadi setelah sukses. Level terakhir yang direkomendasikan tetap tersimpan meskipun pengiriman gagal, agar algoritme tidak pernah mengusulkan pelonggaran stop. Status pengiriman dan level rekomendasi memiliki arti berbeda; keduanya bukan bukti bahwa pengguna telah memasang order SL.
-
-Event recommendation mempunyai kunci unik `(position ID, stage, level stop)`. SQLite membatasi event dan pesan ganda. Event touch memakai level yang disentuh. Saat pause/close/error, rekomendasi pending disupersede. Sebelum pengiriman, dispatcher memeriksa state aktif, umur data, level terbaru, dan posisi harga terhadap stop. Pesan yang sudah dikirim ke jaringan tidak dapat ditarik kembali oleh lock lokal.
-
-Timeout dan respons tidak pasti memakai UNKNOWN, bukan retry otomatis. Crash setelah Telegram menerima pesan tetapi sebelum commit lokal tidak bisa dibedakan dari crash sebelum pengiriman. Restart mengubah SENDING menjadi UNKNOWN. Ini bukan jaminan exactly-once dari Telegram. UNKNOWN mengutamakan penghindaran duplikasi; pesan bisa tidak tersampaikan. Gunakan `/positions` untuk ringkasan baru, atau `/cancel` dan ulang formulir jika prompt hilang.
-
-## Restart dan gangguan
-
-- ACTIVE, TRACKING_ERROR, dan INVALID_DATA menjalani resinkronisasi metadata, candle tertutup, dan quote. Rekomendasi lama pending tidak boleh dianggap valid selama resinkronisasi.
-- PAUSED tetap PAUSED. Tidak ada silent resume setelah restart.
-- EXIT_REPORTED tetap menunggu konfirmasi jika session belum kedaluwarsa. Setelah expiry, status menjadi PAUSED.
-- Ekstrem harga, stop monotonic, aktivasi, ID event, dan offset Telegram tetap tersimpan.
-- Monitor tidak mengarang candle/quote untuk menutup celah data. Nilai ekstrem selama downtime tidak diketahui.
-- Groq dan worker scan tidak dibutuhkan untuk melanjutkan monitoring posisi yang sudah sah.
-- Heartbeat yang basi membuat panel mengosongkan metrik terkini. Harga terakhir tetap tampak dengan timestamp.
-
-## Rollback deployment
-
-Hentikan worker manual, nonaktifkan flag, lalu jalankan kembali aplikasi v5.5 asli bila diperlukan. Tabel `mt_*` boleh tetap ada tanpa digunakan. Jangan menimpa database aktif dengan backup lama karena itu dapat membuang perubahan transaksi sesudah backup. Restore penuh hanya melalui prosedur backup operasional yang Anda setujui. Arsip hasil tidak melakukan restore atau perubahan pada database pengguna.
+## 3. Urutan Pemulihan Restart 8 Langkah (`RestartRecoveryManager`)
+Saat aplikasi/worker dimulai ulang:
+1. Memuat state risiko persisten, status Kill Switch, dan penghitung kerugian beruntun dari `at_risk_state`.
+2. Menghubungkan kembali ke adapter exchange dan menyinkronkan akun (`sync_account`).
+3. Mengambil posisi terbuka dan order aktif aktual dari exchange, serta merekonsiliasi setiap order berstatus `SUBMITTING` atau `UNCERTAIN_TIMEOUT`.
+4. Merekonsiliasi state lokal terhadap posisi dan order exchange (`trigger_source='STARTUP'`).
+5. Memverifikasi cakupan order proteksi SL/TP untuk seluruh posisi terbuka; jika ada posisi tanpa proteksi terverifikasi, langsung mengaktifkan circuit breaker `MISSING_PROTECTIVE_ORDERS`.
+6. Memulihkan tugas pemantauan tanpa duplikasi worker (dijaga oleh OS file lock `worker_lock`).
+7. Memeriksa seluruh circuit breaker dan batas kerugian harian (`at_daily_risk_ledger`).
+8. Mengizinkan entry baru **hanya** jika seluruh pemeriksaan kesiapan dan rekonsiliasi bersih; sinyal lama yang sudah tersimpan di database tidak pernah membuka posisi duplikat.

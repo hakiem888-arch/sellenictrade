@@ -5428,10 +5428,12 @@ def render_app():
     if st.button("🚨 Scan Momentum Sekarang", use_container_width=True, key="v56_manual_scan"):
         _run_v56_monitor()
 
-    # Manual positions remain separate from simulated paper accounting.
-    if _manual_tracking_enabled():
-        from manual_tracker.dashboard import render_panel
-        render_panel(st, DB_FILE, secret)
+    # Manual positions and autonomous operational telemetry remain separate from legacy paper accounting.
+    if _manual_tracking_enabled() or str(secret("AUTONOMOUS_TRADING_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"}:
+        from manual_tracker.dashboard import render_operational_header, render_panel
+        render_operational_header(st, DB_FILE, secret, ai_keys_count=len(GROQ_KEYS))
+        if _manual_tracking_enabled():
+            render_panel(st, DB_FILE, secret)
 
     # Secondary information stays available without competing with the momentum workflow.
     with st.expander("📊 Performa paper trading", expanded=False):

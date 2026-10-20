@@ -32,6 +32,23 @@ from tests.helpers import FakeAPI, TrackingCase, observation
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _ast_dump_py312_compat(node):
+    """Ensure Python < 3.12 ast.dump matches Python 3.12 PEP 695 type_params=[] field order."""
+    patched = []
+    for cls in (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef):
+        if "type_params" not in cls._fields:
+            patched.append((cls, cls._fields))
+            cls._fields = cls._fields + ("type_params",)
+            setattr(cls, "type_params", [])
+    try:
+        return ast.dump(node, include_attributes=False)
+    finally:
+        for cls, orig_fields in patched:
+            cls._fields = orig_fields
+            if hasattr(cls, "type_params"):
+                delattr(cls, "type_params")
+
+
 def result(direction="LONG", aid="regression-long"):
     return dict(final=direction, symbol="BTCUSDT", analysis_id=aid, idempotency_key=aid,
                 scanner_score=80, entry=100, sl=90 if direction == "LONG" else 110,
@@ -52,7 +69,7 @@ class BaselineTests(unittest.TestCase):
                 continue
             if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "DB_FILE" for t in node.targets):
                 continue
-            nodes.append(hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest())
+            nodes.append(hashlib.sha256(_ast_dump_py312_compat(node).encode()).hexdigest())
         self.assertEqual(nodes, manifest["unchanged_nodes_in_order"])
 
     def test_original_momentum_outputs_24_scenarios(self):

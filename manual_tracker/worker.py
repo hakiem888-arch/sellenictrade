@@ -11,10 +11,11 @@ import tempfile
 import threading
 import time
 
-from .config import Config
+from .config import AutonomousConfig, Config
 from .interactions import Interactions
 from .market import BinancePollingFeed
 from .monitor import Monitor
+from .orchestrator import AutonomousSystemOrchestrator
 from .store import Store
 from .telegram import Dispatcher, TelegramAPI, TelegramError
 
@@ -54,9 +55,9 @@ def worker_lock(token, directory=None):
 
 
 class Poller:
-    def __init__(self, store, config, api):
+    def __init__(self, store, config, api, auto_config=None):
         self.store, self.config, self.api = store, config, api
-        self.handler = Interactions(store, config)
+        self.handler = Interactions(store, config, auto_config=auto_config)
 
     def preflight(self):
         info = self.api.call("getWebhookInfo", {})
@@ -112,19 +113,48 @@ class Poller:
 
 
 class Worker:
-    def __init__(self, store, config, api=None, feed=None):
+    def __init__(self, store, config, api=None, feed=None, auto_config=None):
         self.store, self.config = store, config
+        self.auto_config = auto_config or AutonomousConfig.load()
         self.api = api or TelegramAPI(config.token)
-        self.monitor = Monitor(store, config, feed or BinancePollingFeed(config, clock=store.clock))
+        self.feed = feed or BinancePollingFeed(config, clock=store.clock)
+        self.monitor = Monitor(store, config, self.feed)
         self.dispatcher = Dispatcher(store, config, self.api)
-        self.poller = Poller(store, config, self.api)
+        self.poller = Poller(store, config, self.api, auto_config=self.auto_config)
+        self.orchestrator = AutonomousSystemOrchestrator(store, config, self.auto_config, rest_feed=self.feed)
         self.stop = threading.Event()
+        self._last_reconcile = 0.0
+
+    def _autonomous_cycle(self):
+        if not self.auto_config.autonomous_enabled:
+            return
+        now = self.store.clock()
+        env = self.auto_config.execution_mode
+        inst = self.auto_config.default_instrument
+        # Periodic account sync & position reconciliation
+        if (now - self._last_reconcile) >= self.auto_config.reconcile_interval_seconds:
+            snap = self.orchestrator.account.sync_account(inst, environment=env)
+            self.orchestrator.account.reconcile(snap, trigger_source="PERIODIC")
+            self._last_reconcile = now
+
+        # Evaluate trailing stops on active autonomous positions
+        active_pos = self.store.rows(
+            "SELECT * FROM at_positions WHERE environment=? AND position_state IN ('PROTECTED_ACTIVE','PROTECTION_REQUIRED')",
+            (env,),
+        )
+        for pos in active_pos:
+            try:
+                obs = self.feed.observation({"instrument": pos["instrument"], "symbol": pos["symbol"], "multiplier": pos["multiplier"]})
+                self.orchestrator.trailing.evaluate_autonomous_position(pos["id"], obs)
+            except Exception:
+                pass
 
     def _market_loop(self):
         while not self.stop.is_set():
             start = time.monotonic()
             try:
                 self.monitor.cycle()
+                self._autonomous_cycle()
             except Exception:
                 try:
                     self.store.runtime("market", {"state": "ERROR", "error": "DATABASE_OR_MONITOR_FAILURE"})
@@ -150,6 +180,8 @@ class Worker:
             bind_bot(self.store, self.config.token)
             self.dispatcher.recover_inflight()
             self.monitor.recover()
+            if self.auto_config.autonomous_enabled:
+                self.orchestrator.recovery.recover_on_startup()
             threads = [threading.Thread(target=fn, daemon=True, name=name) for fn, name in
                        [(self._market_loop, "manual-market"), (self._delivery_loop, "manual-delivery"), (lambda: self.poller.run(self.stop), "manual-telegram")]]
             for thread in threads:
@@ -165,7 +197,7 @@ class Worker:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="SecretAgent v5.5 manual tracker, advisory only")
+    parser = argparse.ArgumentParser(description="SecretAgent v5.5 Manual Tracker & Autonomous Trading Worker")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--worker", action="store_true")
     mode.add_argument("--status", action="store_true")
@@ -175,9 +207,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         cfg = Config.load()
+        auto_cfg = AutonomousConfig.load()
         if args.check:
             cfg.require_worker()
-            print(json.dumps({"configuration": "VALID", "external_services": "NOT_TESTED", "live_orders": False}))
+            print(json.dumps({
+                "configuration": "VALID",
+                "execution_mode": auto_cfg.execution_mode,
+                "live_trading_enabled": auto_cfg.live_trading_enabled,
+                "autonomous_enabled": auto_cfg.autonomous_enabled,
+                "trailing_mode": auto_cfg.trailing_mode,
+                "external_services": "NOT_TESTED",
+                "live_orders": False,
+            }))
             return 0
         if args.migrate and Path(args.db).is_file():
             backup = str(args.db) + ".manual-backup-" + str(time.time_ns())
@@ -186,14 +227,28 @@ def main(argv=None):
             print("Database backup: " + backup)
         store = Store(args.db)
         if args.migrate:
-            print("mt_* migration 1 complete; legacy tables unchanged.")
+            print("mt_* and at_* migration complete; legacy tables unchanged.")
             return 0
         if args.status:
-            print(json.dumps({"runtime": store.rows("SELECT * FROM mt_runtime"),
-                              "positions": store.rows("SELECT state,COUNT(*) AS total FROM mt_positions GROUP BY state"),
-                              "delivery": store.rows("SELECT state,COUNT(*) AS total FROM mt_outbox GROUP BY state")}, indent=2))
+            orch = AutonomousSystemOrchestrator(store, cfg, auto_cfg)
+            op = orch.operational_summary()
+            print(json.dumps({
+                "runtime": store.rows("SELECT * FROM mt_runtime"),
+                "positions": store.rows("SELECT state,COUNT(*) AS total FROM mt_positions GROUP BY state"),
+                "delivery": store.rows("SELECT state,COUNT(*) AS total FROM mt_outbox GROUP BY state"),
+                "autonomous": {
+                    "execution_mode": op["execution_mode"],
+                    "live_authorization_state": op["live_authorization_state"],
+                    "account_equity_usdt": op["account_equity_usdt"],
+                    "open_positions_count": op["open_positions_count"],
+                    "active_orders_count": op["active_orders_count"],
+                    "protective_order_status": op["protective_order_status"],
+                    "system_health": op["system_health"],
+                    "kill_switch_active": op["kill_switch_active"],
+                },
+            }, indent=2))
             return 0
-        worker = Worker(store, cfg)
+        worker = Worker(store, cfg, auto_config=auto_cfg)
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: worker.stop.set())
         worker.run()

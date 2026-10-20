@@ -1,10 +1,86 @@
-"""Secondary panel. Changes still require the authenticated Telegram owner."""
+"""Operational & secondary panels for SecretAgent v5.5 Momentum Radar UI.
+
+Keeps the simplified Momentum Radar UI clean without reintroducing Market Scanner.
+Provides:
+1. `render_operational_header`: Essential operational telemetry & Kill Switch.
+2. `render_panel`: Existing manual position & trailing stop panel (100% preserved) plus secondary autonomous views.
+"""
 import hmac
 import json
 
-from .config import Config
+from .config import AutonomousConfig, Config
+from .live_guard import LIVE_CONFIRMATION_PHRASE
+from .orchestrator import AutonomousSystemOrchestrator
+from .paper_autonomous import compute_environment_performance
 from .store import Store, uid, utc
 from .telegram import keyboard
+
+
+def render_operational_header(st, db_path, getter, ai_keys_count=0):
+    """Render essential operational status and Kill Switch on the Momentum Radar interface."""
+    try:
+        store = Store(db_path)
+        m_cfg = Config.load(getter)
+        a_cfg = AutonomousConfig.load(getter)
+        orch = AutonomousSystemOrchestrator(store, m_cfg, a_cfg)
+        summary = orch.operational_summary(ai_keys_count=ai_keys_count)
+
+        c1, c2, c3, c4 = st.columns(4)
+        if hasattr(c1, "metric"):
+            c1.metric("Account Equity", f"${summary['account_equity_usdt']} USDT")
+            c2.metric("Available Funds", f"${summary['available_funds_usdt']} USDT")
+            c3.metric("Execution Mode", f"{summary['execution_mode']} ({summary['live_authorization_state']})")
+            c4.metric("Open Positions / Orders", f"{summary['open_positions_count']} / {summary['active_orders_count']}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        if hasattr(c5, "metric"):
+            c5.metric("Aggregate Open Risk", f"${summary['aggregate_open_risk_usdt']} / ${summary['max_open_risk_usdt']}")
+            c6.metric("Daily PnL / Loss Limit", f"${summary['daily_pnl_usdt']} / -${summary['daily_loss_limit_usdt']}")
+            c7.metric("Protective Orders", summary["protective_order_status"])
+            c8.metric("Trailing / Health", f"{summary['trailing_mode']} ({summary['latest_trailing_state']}) · {summary['system_health']}")
+
+        ks_col1, ks_col2, ks_col3 = st.columns(3)
+        if ks_col1.button("🛑 Kill Switch: Hentikan Entry Baru", key="auto_kill_switch_halt"):
+            orch.live_guard.engage_kill_switch(actor="UI_OPERATOR", reason="UI_HALT_NEW_ENTRIES", close_all_positions=False)
+            if hasattr(st, "warning"):
+                st.warning("Kill Switch diaktifkan: seluruh entry baru dihentikan, order proteksi tetap dijaga.")
+        if ks_col2.button("🚨 Emergency Close All Positions", key="auto_kill_switch_close_all"):
+            orch.live_guard.engage_kill_switch(actor="UI_OPERATOR", reason="UI_EMERGENCY_CLOSE_ALL", close_all_positions=True)
+            if hasattr(st, "warning"):
+                st.warning("Emergency Close dijalankan pada posisi terbuka.")
+        if summary["kill_switch_active"] and ks_col3.button("🟢 Reset Kill Switch", key="auto_kill_switch_reset"):
+            orch.live_guard.disengage_kill_switch(actor="UI_OPERATOR")
+            if hasattr(st, "info"):
+                st.info("Kill Switch dinonaktifkan.")
+
+        with st.expander("🛡️ Konfigurasi Risiko, Kesiapan Live & Log Eksekusi (Secondary View)", expanded=False):
+            st.caption(
+                f"Risk/Trade: {float(a_cfg.risk_pct_per_trade)*100:.2f}% · "
+                f"Max Daily Loss: {float(a_cfg.max_daily_loss_pct)*100:.2f}% (${a_cfg.max_daily_loss_usdt}) · "
+                f"Max Open Risk: {float(a_cfg.max_aggregate_open_risk_pct)*100:.2f}% · "
+                f"Max Leverage: {a_cfg.max_permitted_leverage}x · "
+                f"Min R:R: {a_cfg.min_acceptable_rr}"
+            )
+            if summary["active_circuit_breakers"]:
+                st.warning("Active Circuit Breakers: " + ", ".join(summary["active_circuit_breakers"]))
+            if summary["open_positions"]:
+                st.dataframe(summary["open_positions"], use_container_width=True, hide_index=True)
+
+            # Separated Performance by Environment
+            for env_name in ("PAPER", "TESTNET", "LIVE", "BACKTEST"):
+                perf_env = compute_environment_performance(store, env_name, a_cfg.paper_initial_equity)
+                if perf_env["sample_size"] > 0 or env_name == summary["execution_mode"]:
+                    st.caption(
+                        f"[{env_name}] Trades: {perf_env['sample_size']} · Win Rate: {perf_env['win_rate_pct']}% · "
+                        f"Net PnL: ${perf_env['total_net_pnl_usdt']} · Expectancy: ${perf_env['net_expectancy_usdt']} · "
+                        f"Max DD: {perf_env['max_drawdown_pct']}%"
+                    )
+
+            audits = store.rows("SELECT created_at, environment, category, event_type, severity FROM at_audit_events ORDER BY created_at DESC LIMIT 25")
+            if audits:
+                st.dataframe(audits, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
 
 
 def render_panel(st, db_path, getter):

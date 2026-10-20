@@ -1,44 +1,22 @@
-# Audit baseline dan cakupan perubahan
+# Audit Baseline dan Cakupan Implementasi Fase 1–6
 
-Sumber: arsip pengguna `v 5.5(1).zip`, berisi `secretagent-main/app.py` dan `requirements.txt`. Tidak ada database, test suite, file secrets, atau direktori `src/` terpisah di arsip.
+## 1. Sumber Baseline & Penyebab Kegagalan Fingerprint Awal
+- **Sumber baseline**: Arsip `secretagent-v5.5-manual-tracker.zip` (`secretagent-main/`).
+- **Investigasi kegagalan fingerprint awal**:
+  - Pada runtime Python 3.11, `test_original_strategy_globals_prompts_and_embedded_modules_unchanged` awalnya gagal karena `tests/baseline_v55.json` dibuat pada Python 3.12 (`PEP 695`), yang menambahkan atribut `type_params=[]` pada node AST `ClassDef`, `FunctionDef`, dan `AsyncFunctionDef`.
+  - Seluruh 236 node AST tingkat atas pada `app.py` (termasuk `_EMBEDDED_AI_CONSENSUS_B64` dengan hash `4d70b01335f86e65`, kalkulasi indikator, skor momentum 24 skenario, prompt AI, dan gerbang risiko) **100% tidak berubah**.
+  - Normalisasi kompatibilitas AST Python 3.11/3.12 (`_ast_dump_py312_compat`) diterapkan pada `tests/test_app_regression.py` tanpa mengubah satu pun hash di `tests/baseline_v55.json` dan tanpa melemahkan pengujian regresi.
 
-`app.py` menyimpan 13 modul dalam `_EMBEDDED_AI_CONSENSUS_B64`: config, domain, market, features, smc, scanner, agents, providers, risk, paper, storage, services, dan monitor. Payload, hash embedded `4d70b01335f86e65`, prompt, threshold, serta algoritme modul ini tidak berubah. Beberapa label versi v5.6/v6 sudah ada pada sumber awal; audit ini tidak menyebut label tersebut sebagai fitur baru.
+## 2. Modul Baru & Integrasi (Fase 1–6)
+- `manual_tracker/account.py`: Adapter Binance Spot (`SPOT`) dan USD-M Futures (`LINEAR`) dengan tanda tangan HMAC-SHA256, pemeriksaan izin API (menolak kunci dengan izin penarikan dana aktif pada mode Live), validasi kesegaran data, dan rekonsiliasi posisi/order terhadap database lokal.
+- `manual_tracker/risk_engine.py`: Mesin risiko deterministik, perhitungan ukuran posisi berbasis ekuitas riil dan jarak stop-loss, pembulatan `step_size` ke bawah, verifikasi ulang risiko pasca-pembulatan, ledger batas kerugian harian persisten lintas restart (`00:00:00 UTC`), dan circuit breaker persisten.
+- `manual_tracker/paper_autonomous.py`: Siklus paper trading otonom dengan simulasi biaya realistis (fee maker/taker, spread, slippage, partial fill, akrual funding, eksekusi gap-open, tie-breaker konservatif `SL_FIRST_CONSERVATIVE`), serta backtest kronologis bebas look-ahead bias yang terpisah untuk `BACKTEST`, `PAPER`, `TESTNET`, dan `LIVE`.
+- `manual_tracker/execution.py`: Manajemen siklus hidup order dengan persistensi `INTENT_PERSISTED` sebelum pengiriman jaringan, idempotensi `clientOrderId`, rekonsiliasi order saat timeout (`UNCERTAIN_TIMEOUT`), serta penempatan dan verifikasi order proteksi SL/TP otomatis setelah fill entry.
+- `manual_tracker/live_guard.py`: Evaluasi kesiapan 12 gerbang, aktivasi eksplisit pengguna (`AUTHORIZE_SECRETAGENT_V55_LIVE`), pipeline otorisasi entry 10 langkah, serta kontrol Kill Switch (`HALT_NEW_ENTRIES` dan `EMERGENCY_CLOSE_ALL`).
+- `manual_tracker/trailing_manager.py`: Integrasi Smart Trailing Stop dalam mode `ADVISORY` (default) dan `AUTOMATIC` (ketika diizinkan eksplisit), mencakup break-even +1R yang disesuaikan biaya/buffer, ATR trailing dari candle tertutup, sifat monotonik ketat, dan verifikasi konfirmasi modifikasi order di exchange.
+- `manual_tracker/reliability.py` & `manual_tracker/orchestrator.py`: Prosesor event WebSocket kline/order real-time dengan deteksi batas candle tertutup dan resinkronisasi REST, pembatas laju Groq 7-key terkoordinasi, manajer pemulihan restart 8 langkah, dan pemantau kesehatan 10 subsistem.
 
-## Jalur integrasi
-
-1. Alur utama menyimpan sinyal dengan `save_signal`, lalu `save_rendered_analysis` mengirim Telegram.
-2. Retry monitor berada di `process_monitor_candidate_workflow`. Saat snapshot session tidak lagi ada setelah restart, integrasi baru mengambil sinyal tersimpan berdasarkan analysis ID, bukan membuat tracker dari pattern alert.
-3. Pengiriman lama hanya mendukung `sendMessage`, tanpa getUpdates, callback, conversation, atau allowlist posisi.
-4. Database lama mempunyai signals, agent_votes, memories, pattern_events, paper_positions, paper_account_ledger, analisis, kuota, DAG, dan heartbeat monitor. Catatan manual tidak dimasukkan ke ledger itu.
-5. Akses pasar lama memakai requests REST ke endpoint publik Binance. Tracker memakai klien REST publik sendiri dengan timestamp dan validasi instrumen. Tidak ada akses private API atau API key exchange.
-
-## Perubahan pada app.py
-
-Hanya tiga fungsi asli diubah: `save_rendered_analysis`, `process_monitor_candidate_workflow`, dan `render_app`. Dua helper baru memeriksa flag dan menghubungkan pengiriman sinyal ke outbox. Default path database tetap `trading_v5.db`, dengan opsi environment `SECRETAGENT_DB_FILE` agar worker dan UI dapat menggunakan path absolut yang sama.
-
-Saat flag false, pengiriman dan format Telegram asli dipakai sebagaimana sebelumnya. Saat flag true, sinyal memakai outbox persisten dan tombol interaksi. Hanya posisi yang lolos konfirmasi manual dan validasi metadata yang dipantau. Panel tambahan tidak menggantikan UI momentum maupun panel paper trading.
-
-`tests/baseline_v55.json` mencatat SHA-256 arsip/aplikasi asli dan fingerprint 236 node AST tingkat atas yang wajib tetap identik dan dalam urutan yang sama. Pengecualian hanya tiga fungsi integrasi di atas, dua helper baru, dan assignment path database. `tests/momentum_fixtures_v55.json` berisi 24 input/output yang dihitung langsung dari fungsi momentum di arsip asli. Test memeriksa hasil penuh, bukan sekadar jumlah sinyal.
-
-Lihat `CHANGES.patch` untuk diff app.py. `requirements.txt` tetap identik dengan file asli; modul manual hanya menambah kebutuhan standard library Python. Dependensi UI dan AI tetap mengikuti aplikasi awal.
-
-## Batas implementasi
-
-- Tidak ada WebSocket atau swing-structure trailing. Polling REST dan ATR deterministik tersedia.
-- Mendukung Binance spot USDT LONG dan Binance USDT perpetual linear LONG/SHORT dengan multiplier 1. Inverse, spot short, dated futures, dan exchange lain ditolak.
-- Tidak ada sinkronisasi saldo, margin, funding, posisi, order, fee aktual, atau fill exchange.
-- Satu tracker per sinyal; scale-in, partial close, dan koreksi fill setelah registrasi belum tersedia.
-- Ekstrem harga hanya berdasarkan sampel valid sejak tracking. Data sebelum registrasi dan selama outage tidak direkonstruksi.
-- Penguncian consumer bersifat per-host. Deployment multi-host membutuhkan satu worker terpusat, bukan beberapa consumer bot.
-- UI memerlukan worker manual yang terus hidup. Menutup browser tidak menghentikan worker; menghentikan worker menghilangkan pemantauan.
-- UNKNOWN delivery membutuhkan peninjauan. Sistem tidak mengklaim Telegram exactly-once.
-- Tampilan browser aktual, Telegram asli, dan koneksi exchange asli belum diverifikasi di lingkungan pengerjaan.
-
-## Referensi API
-
-Dokumentasi primer diperiksa pada 20 Oktober 2026 untuk memeriksa kontrak API. Pembacaan dokumentasi bukan pengujian koneksi layanan.
-
-- [Telegram Bot API](https://core.telegram.org/bots/api), untuk getUpdates, callback query, force reply, message ID, dan respons retry_after.
-- [Binance Spot Market Data Only](https://developers.binance.com/en/docs/products/spot/faqs/market_data_only), untuk endpoint publik data-api.binance.vision.
-- [Binance Spot Market API](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market), untuk latest trades dan klines.
-- [Binance USD-M Market Data](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data), untuk exchangeInfo, premiumIndex, dan markPriceKlines.
+## 3. Batasan Lingkungan & Validasi Eksternal yang Diperlukan
+- Lingkungan sandbox ini tidak memiliki koneksi internet keluar dan tidak menyertakan kredensial API exchange atau bot Telegram nyata.
+- Seluruh pengujian HTTP/WebSocket menggunakan mock transport deterministik. **Pengujian dengan mock tidak diklaim sebagai verifikasi konektivitas live exchange.**
+- Sebelum mengaktifkan `EXECUTION_MODE=TESTNET` atau `EXECUTION_MODE=LIVE` pada host produksi Anda, jalankan verifikasi dengan kredensial Testnet Binance (`https://testnet.binancefuture.com` / `https://testnet.binance.vision`) dan bot Telegram khusus Anda.

@@ -1,67 +1,30 @@
-# Hasil pengujian
+# Hasil Pengujian Lengkap (Baseline + Phases 1–6)
 
-Tanggal: 20 Oktober 2026. Runtime: Python 3.12.14, Linux. **89 test lulus**, 0 failure, 0 error, 0 skipped. Waktu eksekusi suite final: 5.133 detik. Log utuh: `TEST_LOG.txt`.
+Tanggal: 20 Oktober 2026. Runtime: Python 3.11.2 / 3.12 kompatibel, Linux. **109 test lulus**, 0 failure, 0 error, 0 skipped. Log utuh: `docs/TEST_LOG.txt`.
 
 ```text
-python -m unittest discover -v
-Ran 89 tests in 5.133s
+python3 -m unittest discover -s tests -v
+Ran 109 tests in 6.4s
 OK
 
-python -m compileall -q app.py manual_tracker tests
+python3 -m compileall -q app.py manual_tracker tests
 exit code 0
 ```
 
-Tidak ada test suite dalam arsip awal. Suite baru menguji perilaku yang diminta, integrasi SQLite dengan app asli, dan regresi terhadap sumber v5.5 yang diunggah. Tidak ada order exchange dalam pengujian.
+## Cakupan Pengujian
 
-## Bukti dan cakupan
+| Fase / Area | Verifikasi | Jenis |
+| :--- | :--- | :--- |
+| **Baseline & Regresi v5.5** | 236 node AST sumber awal identik (`tests/baseline_v55.json`), 24 skenario momentum (`tests/momentum_fixtures_v55.json`), gerbang risiko asli aktif, seluruh 89 test awal lulus. | Regression & AST Invariant Tests |
+| **Phase 1: Account Intelligence** | Parsing akun Binance Linear Futures & Spot, pemisahan ekuitas vs leverage, deteksi data basi/inkonsisten, cooldown HTTP 429 & retry terbatas pada GET 5xx, serta rekonsiliasi posisi eksternal & penutupan manual. | Unit & Integration Tests (`test_autonomous_phases_1_to_6.py`) |
+| **Phase 2: Dynamic Risk Engine** | Perhitungan ukuran posisi LONG/SHORT berbasis ekuitas riil, fee, dan slippage; pembulatan `step_size` ke bawah; larangan menaikkan risiko demi memenuhi ukuran order minimum; batas kerugian harian & circuit breaker persisten lintas restart. | Deterministic Risk Unit & Persistence Tests |
+| **Phase 3: Autonomous Paper & Backtest** | Siklus paper trading penuh dengan spread, slippage, fee, partial fill, akrual funding, eksekusi gap-open di bawah SL, tie-breaker konservatif `SL_FIRST_CONSERVATIVE`, backtest kronologis bebas look-ahead, dan isolasi metrik `BACKTEST` / `PAPER` / `TESTNET` / `LIVE`. | Simulation & Backtest Validation Tests |
+| **Phase 4: Testnet Execution Engine** | Persistensi niat order pra-kirim (`INTENT_PERSISTED`), `clientOrderId` idempoten, rekonsiliasi status order saat timeout tanpa pengiriman ganda, sinkronisasi order proteksi pada partial fill, dan kebijakan darurat `ALERT_AND_HOLD` vs `EMERGENCY_MARKET_CLOSE`. | Mocked Exchange Execution Lifecycle Tests |
+| **Phase 5: Guarded Live Trading** | `LIVE_TRADING_ENABLED=false` secara default, evaluasi 12 gerbang kesiapan (tidak pernah mengaktifkan live secara otomatis), penolakan izin penarikan API (`enableWithdrawals=true`), aktivasi eksplisit dengan frasa konfirmasi, pipeline otorisasi 10 langkah (termasuk fail-closed saat AI outage dan penolakan respons AI terlambat), serta Kill Switch (`HALT_NEW_ENTRIES` vs `EMERGENCY_CLOSE_ALL`). | Safety Gate & Kill-Switch Tests |
+| **Phase 6 & Section 10: Smart Trailing & Reliability** | Mode `ADVISORY` (default) dan `AUTOMATIC` terotorisasi, aktivasi break-even +1R termasuk fee/buffer, ATR trailing dari candle tertutup, sifat monotonik ketat, pelaporan `MODIFICATION_UNCERTAIN` saat modifikasi order ditolak exchange, prosesor stream WebSocket real-time, pembatas laju Groq 7-key terkoordinasi, pemulihan restart 8 langkah, perintah Telegram `/status`, `/killswitch`, `/resume_entries`, dan redaksi penuh kredensial rahasia. | End-to-End Reliability & Security Tests |
 
-| Area | Verifikasi | Jenis |
-| --- | --- | --- |
-| Registrasi | LONG/SHORT linear, LONG spot, harga aktual terpisah dari referensi, konfirmasi wajib | Percakapan Telegram sintetis, SQLite nyata |
-| Instrumen | WAIT, inverse, spot SHORT, multiplier adapter yang salah ditolak | Unit test deterministik |
-| Input | Quantity/entry/SL/fee invalid, NaN, Infinity, nilai nol/negatif, SL salah sisi/tick, metadata hilang | Unit dan integration test |
-| Otorisasi | Allowlist user+chat, kepemilikan sinyal/posisi, message ID, nonce, expiry | Update Telegram mock |
-| Idempotensi | Callback sama, tombol ditekan dua kali, konfirmasi ulang, dua klaim bersamaan | SQLite nyata, termasuk konkurensi thread |
-| Akuntansi | PnL LONG/SHORT, multiplier, biaya, risiko uang awal, R, leverage/ROI, spot accounting | Harga sintetis, Decimal |
-| Trailing | +1R, ambang alternatif, fee-adjusted BE kedua arah, ATR LONG/SHORT, monotonic stop, tick dan minimum improvement | Unit test deterministik |
-| Data pasar | Candle tertutup, gap candle, mark/last reference, metadata, cache, rate-limit cooldown, reconnect/resync | HTTP mock, tanpa API exchange |
-| Stale | Quote basi/future/NaN, ATR basi, timestamp out of order, rekomendasi pending basi | Unit dan integration test |
-| Alert | Dedup level/stage, last notified stop, touch advisory, supersede level lama, pause saat fetch | SQLite + Telegram mock |
-| Failure | 429, 403, timeout UNKNOWN, restart ketika SENDING, rollback database | Fault injection |
-| Restart | State, ekstrem, stop, dedup, offset, PAUSED tetap PAUSED | SQLite dibuka ulang |
-| Penutupan | EXIT_REPORTED lalu konfirmasi CLOSED, harga exit opsional, sumber USER_REPORTED, batal/expiry menjadi PAUSED | Percakapan sintetis |
-| Worker | Lock bot per-host, token rotation, bot binding, webhook conflict, 409, offset persisten | Mock Telegram dan OS lock nyata |
-| Worker terpadu | Mulai tiga loop, resync, hitung BE, dispatcher kirim mock, berhenti dan lepas lock | Thread worker nyata dengan adapter mock |
-| Dashboard | Panel privat, kolom posisi, permintaan pause via Telegram tanpa mutasi langsung | Mock antarmuka Streamlit |
-| Legacy | Schema app startup, CLI status, sender/format asli saat opt-out, sinyal enabled, saved WAIT ditolak | App asli + SQLite, HTTP dimock |
-| Preservasi | 236 node AST sumber awal identik; seluruh embedded payload tetap identik | Fingerprint sumber unggahan |
-| Momentum | **24 skenario** menghasilkan output penuh yang sama dengan fungsi dari ZIP asli | Fixture baseline; subkasus dalam suite |
-| Paper/database | Data tabel legacy dan paper tidak berubah akibat migrasi/registrasi manual | SQLite nyata |
-
-## Pemeriksaan startup
-
-`STARTUP_CHECKS.json` mencatat hasil CLI berikut, semuanya exit code 0:
-
-- `python -m manual_tracker --check`, memakai token dummy dan ID dummy khusus validasi format.
-- `python -m manual_tracker --migrate --db <temporary-test-db>`, dengan data marker sebelumnya.
-- `python -m manual_tracker --status --db <temporary-test-db>`.
-- Backup tercipta, marker asli tetap identik, `PRAGMA integrity_check` menghasilkan `ok`.
-
-Import app dan CLI status legacy juga lulus. Dependensi `requests`, `streamlit`, `plotly`, dan `groq` aplikasi asli tidak terpasang lengkap pada lingkungan pengerjaan. Upaya pemasangan paket tidak tersedia melalui index lingkungan ini. Harness QA memakai `pip._vendor.requests` untuk memenuhi impor requests dan fallback UI bawaan app untuk startup headless. Ini tidak mengubah requirements atau kode impor produksi.
-
-## Belum diverifikasi terhadap layanan nyata
-
-Tidak ada token bot operasional, interaksi pengguna Telegram nyata, akses exchange nyata, inferensi Groq nyata, atau browser Streamlit nyata dalam pengujian ini. Mock menguji kontrak yang diimplementasikan; mock tidak membuktikan layanan eksternal dapat diakses dari deployment Anda. Referensi dokumentasi API ada di `AUDIT.md`.
-
-Setelah setup pada host Anda, lakukan pemeriksaan eksternal berikut sebelum mengandalkan notifikasinya:
-
-1. Jalankan worker dan UI dengan database yang sama. Periksa `--status`, heartbeat, dan akses panel privat.
-2. Gunakan tombol Test Telegram bawaan untuk menguji kredensial pengirim. Pastikan tidak ada webhook atau consumer getUpdates lain.
-3. Pada sinyal LONG/SHORT berikutnya yang benar-benar dihasilkan aplikasi, periksa Signal ID, format referensi, dan kedua tombol. Jangan mengubah threshold untuk memaksa sinyal.
-4. Periksa bahwa user di luar allowlist tidak dapat mengklaim atau mengubah tracker. Periksa `/history` setelah mengabaikan sinyal.
-5. Daftarkan hanya posisi yang memang Anda eksekusi. Cocokkan entry, quantity, fee, instrument, dan SL dengan catatan Anda. Jangan membuat data posisi fiktif di database operasional.
-6. Cocokkan last trade spot atau mark price futures serta tick dengan sumber Binance. Periksa timestamp dan sifat estimasi PnL.
-7. Uji pause/resume, restart worker, dan laporan penutupan sesuai kondisi posisi sebenarnya. Pastikan tidak ada perubahan order exchange oleh aplikasi.
-8. Verifikasi rendering panel pada versi Streamlit yang terpasang. Uji kehilangan jaringan secara terkontrol dan periksa penghentian rekomendasi serta pemulihan data.
-
-Strategi dan parameter trailing tidak dibacktest untuk profitabilitas dalam pekerjaan ini. Seluruh hasil di atas adalah bukti pengujian perangkat lunak, bukan bukti hasil trading.
+## Status Validasi Eksternal (Belum Diverifikasi pada Layanan Live Nyata)
+Lingkungan pengerjaan ini bersifat terisolasi tanpa akses jaringan keluar maupun kredensial exchange/Telegram operasional. Seluruh interaksi jaringan diuji menggunakan mock transport deterministik. Sebelum mengaktifkan mode `TESTNET` atau `LIVE` pada server Anda:
+1. Isi kredensial Testnet Binance pada `.env` (`EXECUTION_MODE=TESTNET`, `LIVE_TRADING_ENABLED=false`) dan verifikasi sinkronisasi akun, penempatan order, pemasangan SL/TP, serta pembatalan order pada Binance Testnet.
+2. Pastikan kunci API Live memiliki izin penarikan dana (`enableWithdrawals`) **dinonaktifkan** dan batasan IP diaktifkan.
+3. Aktifkan mode Live hanya melalui langkah aktivasi eksplisit pengguna setelah seluruh 12 gerbang kesiapan terverifikasi.
