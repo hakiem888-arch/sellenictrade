@@ -7,6 +7,7 @@ Strictly zero side-effects on import.
 
 import copy
 import hashlib
+import json
 import time
 import uuid
 from datetime import datetime, timezone
@@ -238,6 +239,7 @@ def format_telegram_event_message(
     sig_state = normalize_signal_lifecycle_state(
         payload.get("signal_state")
         or payload.get("state")
+        or payload.get("lifecycle_state")
         or ("INVALIDATED" if "INVALID" in ev_norm else ("TRIGGERED" if direction in {"LONG", "SHORT"} else "WAIT"))
     )
     tf_str = str(payload.get("timeframe") or "5m/15m/1h")
@@ -245,7 +247,9 @@ def format_telegram_event_message(
     sig_id = str(payload.get("signal_id") or payload.get("position_id") or payload.get("idempotency_key") or f"evt_{sym}_{ev_norm}")
 
     exec_mode = str(payload.get("execution_mode") or "PAPER").upper().strip()
-    ord_status = str(payload.get("order_status") or payload.get("status") or sig_state).upper().strip()
+    ord_status = str(
+        payload.get("order_status") or payload.get("status") or payload.get("lifecycle_state") or sig_state
+    ).upper().strip()
 
     if "PAPER_TRADE" in ev_norm:
         badge = EXECUTION_CLASSIFICATION_BADGES["PAPER_TRADE_FILL"]
@@ -410,7 +414,9 @@ def dispatch_telegram_event(
     ev_norm = str(event_type or "SIGNAL_TRIGGERED").upper().strip()
     sym = str(payload.get("symbol") or "SYSTEM").upper().strip()
     direction = str(payload.get("direction") or payload.get("final") or "WAIT").upper().strip()
-    sig_state = normalize_signal_lifecycle_state(payload.get("signal_state") or payload.get("state") or "WAIT")
+    sig_state = normalize_signal_lifecycle_state(
+        payload.get("signal_state") or payload.get("state") or payload.get("lifecycle_state") or "WAIT"
+    )
     tf_str = str(payload.get("timeframe") or "5m/15m/1h")
     sig_id = str(
         payload.get("signal_id")
@@ -422,7 +428,25 @@ def dispatch_telegram_event(
     )
 
     if not event_key:
-        raw_k = f"{ev_norm}|{sym}|{sig_id}|{sig_state}|{direction}"
+        # Keep one alert per unchanged logical event, but distinguish multiple exchange orders/fills
+        # belonging to the same signal or position. Without these fields, a later partial exit could
+        # be incorrectly suppressed forever by the first partial-exit event for that position.
+        event_identity_fields = (
+            "event_id", "execution_event_id", "fill_id", "trade_id",
+            "exchange_order_id", "order_id", "client_order_id",
+            "executed_qty", "filled_qty", "cumulative_filled_qty", "quantity", "open_qty",
+            "avg_fill_price", "entry", "exit_price", "net_pnl",
+            "order_status", "status", "lifecycle_state", "veto_codes", "reason", "order_ids", "fills",
+            "event_timestamp", "timestamp", "created_at", "closed_at",
+        )
+        event_identity = {
+            key: payload[key]
+            for key in event_identity_fields
+            if key in payload and payload[key] is not None
+        }
+        identity_json = json.dumps(event_identity, sort_keys=True, separators=(",", ":"), default=str)
+        identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()[:16] if event_identity else "base"
+        raw_k = f"{ev_norm}|{sym}|{sig_id}|{sig_state}|{direction}|{identity_hash}"
         event_key = f"tgevt_{hashlib.sha256(raw_k.encode('utf-8')).hexdigest()[:20]}"
 
     if not tg_enabled:

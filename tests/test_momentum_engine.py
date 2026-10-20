@@ -612,6 +612,47 @@ class TestMomentumEngineIntegration(unittest.TestCase):
         redacted = redact_secrets("Error calling https://api.telegram.org/bot123456:ABCDEF_SECRET_TOKEN/sendMessage")
         self.assertNotIn("ABCDEF_SECRET_TOKEN", redacted)
 
+    def test_telegram_dedup_distinguishes_partial_fills_for_same_position(self):
+        mock_post = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "ok"
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        common = {
+            "symbol": "SOLUSDT",
+            "direction": "LONG",
+            "signal_id": "sig_sol_repeat",
+            "position_id": "pos_sol_repeat",
+            "lifecycle_state": "EXIT_PARTIALLY_FILLED",
+            "entry": 150.0,
+        }
+        first = dispatch_telegram_event(
+            "EXIT_PARTIAL_FILL",
+            {**common, "exchange_order_id": "exit-order-1", "executed_qty": 0.2, "exit_price": 151.0, "net_pnl": 0.2},
+            db_file=self.db_path, state={}, tg_enabled=True,
+            tg_token="123456:ABCDEF_SECRET_TOKEN", tg_chat="-100999999", post_fn=mock_post,
+        )
+        second_payload = {**common, "exchange_order_id": "exit-order-2", "executed_qty": 0.3, "exit_price": 152.0, "net_pnl": 0.6}
+        second = dispatch_telegram_event(
+            "EXIT_PARTIAL_FILL", second_payload,
+            db_file=self.db_path, state={}, tg_enabled=True,
+            tg_token="123456:ABCDEF_SECRET_TOKEN", tg_chat="-100999999", post_fn=mock_post,
+        )
+        repeated = dispatch_telegram_event(
+            "EXIT_PARTIAL_FILL", second_payload,
+            db_file=self.db_path, state={}, tg_enabled=True,
+            tg_token="123456:ABCDEF_SECRET_TOKEN", tg_chat="-100999999", post_fn=mock_post,
+        )
+
+        self.assertTrue(first["sent"])
+        self.assertTrue(second["sent"])
+        self.assertNotEqual(first["event_key"], second["event_key"])
+        self.assertTrue(repeated["deduplicated"])
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertIn("EXIT_PARTIALLY_FILLED", second["message"])
+
     def test_backtest_and_walk_forward_validation(self):
         df_15m = make_synthetic_ohlcv(260, start_price=100.0, trend=0.15, interval="15m", interval_sec=900)
         df_1h = make_synthetic_ohlcv(120, start_price=100.0, trend=0.15, interval="1h", interval_sec=3600)

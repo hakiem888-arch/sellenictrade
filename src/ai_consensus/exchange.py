@@ -1469,6 +1469,7 @@ def activate_kill_switch(
                 "symbol": "SYSTEM",
                 "direction": "WAIT",
                 "state": "INVALIDATED",
+                "event_timestamp": updated.get("kill_switch_activated_at") or now_iso,
                 "reason": (
                     f"Kill Switch Diaktifkan: {reason} | Status Verifikasi: {verification_status} | "
                     f"Entry Dibatalkan: {len(canceled_orders)} | Proteksi SL/TP Dipertahankan: {len(preserved_protective_orders)}"
@@ -1541,6 +1542,13 @@ def reconcile_live_exchange_state(
       and records a structured audit log.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
+    previous_reconciliation_status = "UNKNOWN"
+    try:
+        previous_state = get_circuit_breaker_and_kill_switch_state(db_file=db_file)
+        previous_reconciliation_status = str(previous_state.get("reconciliation_status") or "OK").upper()
+    except Exception:
+        # Do not let an observability read prevent account reconciliation itself.
+        previous_reconciliation_status = "UNKNOWN"
     snap = adapter.synchronize_account(db_file=db_file)
     if not snap.sync_ok:
         evaluate_and_persist_circuit_breakers(
@@ -1716,13 +1724,14 @@ def reconcile_live_exchange_state(
         db_file=db_file,
     )
 
-    if has_mismatch and tg_enabled:
+    if has_mismatch and tg_enabled and previous_reconciliation_status != "MISMATCH":
         dispatch_telegram_event(
             "RECONCILIATION_MISMATCH",
             {
                 "symbol": ",".join(unprotected_symbols) if unprotected_symbols else "PORTFOLIO",
                 "direction": "WAIT",
                 "state": "INVALIDATED",
+                "event_timestamp": now_iso,
                 "reason": f"Reconciliation mismatch ({len(discrepancies)} temuan): {'; '.join(discrepancies[:3])}",
             },
             db_file=db_file,
@@ -2403,6 +2412,7 @@ class AutonomousExecutionEngine:
                     "symbol": sym,
                     "direction": direction,
                     "signal_id": sig_id,
+                    "exchange_order_id": ent_ord.order_id,
                     "entry": sizing.entry,
                     "sl": sizing.stop_loss,
                     "tp": sizing.take_profit,
@@ -2682,6 +2692,9 @@ class AutonomousExecutionEngine:
                 "direction": direction,
                 "signal_id": sig_id,
                 "position_id": pos_id,
+                "exchange_order_id": ent_ord.order_id,
+                "executed_qty": filled_qty,
+                "avg_fill_price": ent_ord.avg_fill_price or sizing.entry,
                 "entry": ent_ord.avg_fill_price or sizing.entry,
                 "sl": sizing.stop_loss,
                 "tp": sizing.take_profit,
@@ -2829,6 +2842,8 @@ def close_live_position(
                 "direction": direction,
                 "signal_id": sig_id,
                 "position_id": position_id,
+                "exchange_order_id": ex_ord.order_id,
+                "executed_qty": filled_exit,
                 "entry": entry_fill,
                 "exit_price": exit_fill,
                 "net_pnl": net_pnl,
