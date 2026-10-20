@@ -1,0 +1,23 @@
+[
+  {
+    "command": "python -m manual_tracker --check",
+    "exit_code": 0,
+    "output": "{\"configuration\": \"VALID\", \"external_services\": \"NOT_TESTED\", \"live_orders\": false}\n"
+  },
+  {
+    "command": "python -m manual_tracker --migrate",
+    "exit_code": 0,
+    "output": "Database backup: <temporary-test-db>.manual-backup-1792468876182679263\nmt_* migration 1 complete; legacy tables unchanged.\n"
+  },
+  {
+    "command": "python -m manual_tracker --status",
+    "exit_code": 0,
+    "output": "{\n  \"runtime\": [],\n  \"positions\": [],\n  \"delivery\": []\n}\n"
+  },
+  {
+    "preserved_original_data": true,
+    "sqlite_integrity": "ok",
+    "backup_created": true,
+    "external_calls": 0
+  }
+]

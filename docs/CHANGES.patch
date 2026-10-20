@@ -1,0 +1,68 @@
+--- original-v5.5/app.py
++++ manual-tracker-v5.5/app.py
+@@ -468,7 +468,7 @@
+     )
+ 
+ BINANCE = "https://data-api.binance.vision"
+-DB_FILE = "trading_v5.db"
++DB_FILE = os.getenv("SECRETAGENT_DB_FILE", "trading_v5.db")
+ 
+ # -------------------------
+ # Secrets
+@@ -4130,7 +4130,7 @@
+         and ikey not in target["notified_analysis_ids"]
+     ):
+         try:
+-            ok, msg = telegram(telegram_message(stored))
++            ok, msg = _telegram_for_saved_signal(stored, signal_id)
+             tg_sent = bool(ok)
+             tg_msg = _safe_ui_error(msg)
+         except Exception as tg_exc:
+@@ -4334,6 +4334,20 @@
+     if _cfg_mod is not None:
+         return str(redact_secrets(str(err_or_msg or ""), extra_secrets=extra_s))
+     return str(err_or_msg or "")
++
++
++def _manual_tracking_enabled():
++    return str(secret("MANUAL_TRACKING_ENABLED") or "false").strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _telegram_for_saved_signal(result, signal_id):
++    if not _manual_tracking_enabled():
++        return telegram(telegram_message(result))
++    try:
++        from manual_tracker.bridge import queue_saved_signal
++        return queue_saved_signal(DB_FILE, secret, signal_id, telegram_message(result))
++    except Exception as exc:
++        return False, _safe_ui_error(exc)
+ 
+ 
+ def telegram(message):
+@@ -4854,7 +4868,13 @@
+ 
+     if val_status == "VALIDATED_ENTRY" and pers_status == "SAVED" and tg_enabled and notif_status != "SENT":
+         stored = get_rendered_analysis(state=target, analysis_id=aid) if aid else None
+-        if stored is not None:
++        if _manual_tracking_enabled():
++            try:
++                from manual_tracker.bridge import retry_saved_analysis
++                ok_tg, msg_tg = retry_saved_analysis(DB_FILE, secret, aid)
++            except Exception as exc:
++                ok_tg, msg_tg = False, _safe_ui_error(exc)
++        elif stored is not None:
+             ok_tg, msg_tg = telegram(telegram_message(stored))
+         else:
+             ok_tg, msg_tg = telegram(pattern_alert_message(snap))
+@@ -5408,6 +5428,11 @@
+     if st.button("🚨 Scan Momentum Sekarang", use_container_width=True, key="v56_manual_scan"):
+         _run_v56_monitor()
+ 
++    # Manual positions remain separate from simulated paper accounting.
++    if _manual_tracking_enabled():
++        from manual_tracker.dashboard import render_panel
++        render_panel(st, DB_FILE, secret)
++
+     # Secondary information stays available without competing with the momentum workflow.
+     with st.expander("📊 Performa paper trading", expanded=False):
+         perf = performance() or {}
