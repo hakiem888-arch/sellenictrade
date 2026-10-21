@@ -4498,6 +4498,9 @@ def telegram_message(result):
 
     return f"""🚨 AI TRADING V5.5
 
+🏷️ MODE: SCALPING | Entry TF: 5m | Konfirmasi: 15m/1H
+⏳ Horizon: pendek; evaluasi tiap candle 5m (bukan jaminan posisi ditutup dalam 5 menit)
+
 {icon} {result['symbol']}
 SIGNAL: {final}
 CONFIDENCE: {result['portfolio']['confidence']:.0f}/100
@@ -5102,6 +5105,8 @@ def pattern_alert_message(snap):
     )
     return (
         f"🚨 V5.6 MOMENTUM ALERT\n\n"
+        f"🏷️ MODE UTAMA: SCALPING | Entry 5M | Konfirmasi 15M + arah 1H\n"
+        f"⏳ Horizon pendek; tunggu candle tertutup, jangan entry hanya karena alert muncul.\n\n"
         f"{snap.get('symbol', '-')} — {p.get('state', '-')}\n"
         f"Direction: {p.get('direction', 'WAIT')}\n"
         f"Radar score: {p.get('score', 0)}/100\n"
@@ -5110,7 +5115,8 @@ def pattern_alert_message(snap):
         f"📊 Intraday: {intra_str}\n"
         f"🌊 Swing: {swing_str}\n\n"
         f"Evidence:\n{evidence_lines}\n\n"
-        f"⚠️ Radar only — AI council masih harus memvalidasi sebelum paper trade."
+        f"🧪 FILTER KETAT: prioritaskan TRIGGERED + arah LONG/SHORT + score tinggi; abaikan WAIT/DEVELOPING.\n"
+        f"⚠️ Radar only — alert bukan order; cek biaya, spread, R:R dan validasi AI sebelum paper trade."
     )
 
 

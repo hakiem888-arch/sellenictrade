@@ -69,15 +69,19 @@ class MomentumRadarAIStrategy(IStrategy):
     timeframe = "5m"
     can_short: bool = False
 
+    # Conservative short-horizon defaults; must be validated with fees/slippage in backtests.
     minimal_roi = {
-        "120": 0.005,
-        "60": 0.015,
-        "30": 0.025,
-        "0": 0.045,
+        "60": 0.003,
+        "30": 0.005,
+        "15": 0.008,
+        "0": 0.012,
     }
 
-    stoploss = -0.05
-    trailing_stop = False
+    stoploss = -0.025
+    trailing_stop = True
+    trailing_stop_positive = 0.003
+    trailing_stop_positive_offset = 0.006
+    trailing_only_offset_is_reached = True
     process_only_new_candles = True
     use_exit_signal = True
     exit_profit_only = False
@@ -86,9 +90,9 @@ class MomentumRadarAIStrategy(IStrategy):
 
     # Hyperoptable parameters
     buy_rsi_min = IntParameter(low=25, high=55, default=40, space="buy", optimize=True, load=True)
-    buy_rsi_max = IntParameter(low=56, high=80, default=68, space="buy", optimize=True, load=True)
+    buy_rsi_max = IntParameter(low=56, high=80, default=65, space="buy", optimize=True, load=True)
     buy_vol_ratio = DecimalParameter(
-        low=0.8, high=2.5, default=1.1, decimals=2, space="buy", optimize=True, load=True
+        low=0.8, high=2.5, default=1.3, decimals=2, space="buy", optimize=True, load=True
     )
     sell_rsi_threshold = IntParameter(
         low=65, high=90, default=76, space="sell", optimize=True, load=True
@@ -97,7 +101,7 @@ class MomentumRadarAIStrategy(IStrategy):
         default=False, space="buy", optimize=False, load=True
     )
     min_ai_confidence = IntParameter(
-        low=55, high=90, default=70, space="buy", optimize=True, load=True
+        low=55, high=95, default=80, space="buy", optimize=True, load=True
     )
 
     @staticmethod

@@ -13,12 +13,13 @@
   "margin_mode": "",
   "timeframe": "5m",
   "minimal_roi": {
-    "60": 0.01,
-    "30": 0.02,
-    "0": 0.04
+    "60": 0.003,
+    "30": 0.005,
+    "15": 0.008,
+    "0": 0.012
   },
-  "stoploss": -0.10,
-  "trailing_stop": false,
+  "stoploss": -0.025,
+  "trailing_stop": true,
   "use_exit_signal": true,
   "exit_profit_only": false,
   "ignore_roi_if_entry_signal": false,
@@ -95,5 +96,8 @@
   "strategy": "MomentumRadarAIStrategy",
   "strategy_path": "user_data/strategies",
   "dataformat_ohlcv": "feather",
-  "dataformat_trades": "feather"
+  "dataformat_trades": "feather",
+  "trailing_stop_positive": 0.003,
+  "trailing_stop_positive_offset": 0.006,
+  "trailing_only_offset_is_reached": true
 }
