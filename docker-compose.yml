@@ -1,0 +1,56 @@
+---
+# Docker Compose Orchestration: Streamlit Momentum Radar v5.5 + Freqtrade Backend
+# Compatible with Windows (Docker Desktop / WSL2), macOS, and Linux.
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:stable
+    container_name: momentum_radar_freqtrade
+    restart: unless-stopped
+    volumes:
+      - "./user_data:/freqtrade/user_data"
+      - "./strategies:/freqtrade/strategies:ro"
+    # Security: Bind REST API strictly to localhost (127.0.0.1) on the host machine
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - ENABLE_LIVE_TRADING=${ENABLE_LIVE_TRADING:-false}
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3.dryrun.sqlite
+      --config /freqtrade/user_data/config.json
+      --strategy ${FREQTRADE_STRATEGY:-MomentumRadarAIStrategy}
+      --strategy-path /freqtrade/user_data/strategies
+      --dry-run
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/api/v1/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  streamlit_dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: momentum_radar_dashboard
+    restart: unless-stopped
+    depends_on:
+      - freqtrade
+    ports:
+      - "127.0.0.1:8501:8501"
+    env_file:
+      - .env
+    environment:
+      - FREQTRADE_API_URL=http://freqtrade:8080
+      - FREQTRADE_API_HOST=freqtrade
+      - FREQTRADE_API_PORT=8080
+      - FREQTRADE_USER_DATA_DIR=/app/user_data
+      - FREQTRADE_CONFIG_PATH=/app/user_data/config.json
+      - AI_CONSENSUS_DB_PATH=/app/data/signals.db
+      - FREQTRADE_DRYRUN_DB_PATH=/app/user_data/tradesv3.dryrun.sqlite
+      - ENABLE_LIVE_TRADING=false
+    volumes:
+      - "./user_data:/app/user_data"
+      - "./strategies:/app/strategies"
+      - "./app_data:/app/data"

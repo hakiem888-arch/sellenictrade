@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    ENABLE_LIVE_TRADING=false
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY app.py /app/app.py
+COPY src /app/src
+COPY services /app/services
+COPY pages /app/pages
+COPY strategies /app/strategies
+COPY ft_client /app/ft_client
+COPY user_data /app/user_data
+COPY LICENSE /app/LICENSE
+
+RUN mkdir -p /app/data /app/user_data/logs /app/user_data/backups
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health')" || exit 1
+
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
