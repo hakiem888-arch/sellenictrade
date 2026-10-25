@@ -1,5 +1,6 @@
-streamlit
-pandas
-plotly
-langchain-groq
-requests
+streamlit==1.66.1
+pandas==2.2.3
+numpy==2.3.5
+plotly==7.1.0
+requests==2.34.2
+tzdata==2026.5
